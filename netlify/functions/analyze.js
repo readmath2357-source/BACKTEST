@@ -1,8 +1,6 @@
-// netlify/functions/analyze.js
-// Dual-mode analysis: simple vs strategic
-// Output order: direction → entry timing → exit strategy → comment → summary
-// Entry = current price (즉시 진입)
-// Labels: above entry = 저항(resistance), below entry = 지지(support)
+// netlify/functions/analyze.js v5.0
+// Backtest: MACD(12,26,9) + Bollinger Bands(20,2) + VWAP + ATR(14)
+// Three non-overlapping axes: Trend(MACD) + Volatility(BB) + FairValue(VWAP)
 
 const headers = {
   'Content-Type': 'application/json',
@@ -11,225 +9,116 @@ const headers = {
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
 };
 
-// ── SYSTEM PROMPTS ──
+const SYSTEM_BASE = `You are a technical analyst. Core: CUT LOSSES SHORT, LET WINNERS RUN.
 
-const SYSTEM_BASE = `You are an expert technical analyst. You analyze price action using four indicators with CLEAR PRIORITY:
+## INDICATORS
 
-## PRIMARY INDICATORS (Entry Point Decision)
+### MACD (12,26,9) — PRIORITY 1: Direction
+- MACD Line = EMA(12) - EMA(26)
+- Signal Line = EMA(MACD, 9)
+- Histogram = MACD - Signal
+- MACD above Signal = BULLISH direction
+- MACD below Signal = BEARISH direction
+- Histogram sign flip = PRIMARY ENTRY TRIGGER
+- MACD > 0 = bullish territory, < 0 = bearish territory (affects confidence)
+- Divergence (price vs MACD histogram) = lowers confidence
 
-### 1. TSI (True Strength Index) — Parameters: (13, 8, 8) — PRIORITY 1
-- TSI Line = 100 × EMA(EMA(price_change, 13), 8) / EMA(EMA(|price_change|, 13), 8)
-- Signal Line = EMA(TSI, 8)
-- TSI ABOVE signal → Bullish momentum | BELOW signal → Bearish
-- TSI near +25 or above = strong bullish / near -25 or below = strong bearish
-- TSI crossing zero = potential trend change
-- TSI-Signal crossover is the PRIMARY entry trigger
-- Divergence between TSI and price = high-probability reversal signal
+### Bollinger Bands (20, 2) — PRIORITY 2: Volatility Filter (MANDATORY)
+- Middle Band = SMA(20) — dynamic trend filter
+- Upper Band = SMA(20) + 2×StdDev(20) — natural resistance
+- Lower Band = SMA(20) - 2×StdDev(20) — natural support
+- Price ABOVE BB Middle → only LONG allowed
+- Price BELOW BB Middle → only SHORT allowed
+- Band Width < 3% = squeeze (breakout imminent, raises confidence)
+- BB provides natural TP/SL zone references
 
-### 2. RSI — Parameters: Length 21, SMA Length 21 — PRIORITY 2
-- RSI(21) with SMA(RSI, 21) overlay
-- RSI ABOVE SMA → Bullish | BELOW SMA → Bearish
-- RSI > 70 = Overbought | RSI < 30 = Oversold
-- RSI-SMA crossover confirms TSI signals
-- RSI divergence adds conviction to entries
+### VWAP — PRIORITY 3: Institutional Confirmation
+- VWAP = cumulative(typical_price × volume) / cumulative(volume)
+- Price above VWAP = confirms bullish (institutional buyers)
+- Price below VWAP = confirms bearish (institutional sellers)
+- VWAP confluence with BB middle = very strong S/R
 
-## SUPPLEMENTARY INDICATORS (Confirmation & Context)
+### ENTRY RULES (3 conditions must align)
+- MACD > Signal + price > BB Middle + price > VWAP → LONG
+- MACD < Signal + price < BB Middle + price < VWAP → SHORT
+- Any of the 3 disagree → HOLD
+That is the ONLY entry/hold decision. Nothing else blocks entry.
 
-### 3. VOLUME — SUPPLEMENTARY
-- Rising volume with trend = continuation confirmation
-- Declining volume = exhaustion warning
-- Volume spikes at key levels = institutional activity
+### CONFIDENCE LEVEL (does NOT block entry, only adjusts confidence)
+HIGH confidence (all favorable):
+- MACD on correct side of zero (LONG: MACD>0, SHORT: MACD<0)
+- MACD histogram slope confirms direction
+- BB squeeze breakout or gap widening + no divergence + volume confirms
 
-### 4. ICT CONCEPTS — SUPPLEMENTARY
-- Order Blocks (OB): institutional supply/demand zones
-- Fair Value Gaps (FVG): imbalance zones price tends to fill
-- Liquidity zones: stop-loss clusters
-- Break of Structure (BOS) / Change of Character (CHoCH)
-- Premium/Discount zones (above/below 50% of swing range)
+MODERATE confidence (mixed signals):
+- MACD on wrong side of zero but crossover confirmed
+- BB bands stable, no squeeze
 
-## CONFLUENCE SCORING
-Primary indicators (TSI + RSI) determine direction.
-Supplementary indicators (Volume + ICT) modify confidence.
+LOW confidence (caution):
+- Histogram slope contradicts direction
+- Gap narrowing or divergence detected
+- Volume declining or price near BB opposite band
 
-IMPORTANT OUTPUT RULES:
-- ENTRY IS ALWAYS AT CURRENT PRICE (즉시 진입). Do NOT provide an entry zone.
-- For levels, label them relative to entry: above entry = 저항(resistance), below entry = 지지(support)
-- For LONG: TP levels are above entry → 저항, SL levels are below entry → 지지
-- For SHORT: TP levels are below entry → 지지, SL levels are above entry → 저항
-- All text output must be in Korean
-- Keep comments concise
-- NEVER mention "TSI", "RSI", "ICT", "Order Block", "FVG", "BOS" in user-facing text
-- Use abstract terms instead: 추세(trend), 모멘텀(momentum), 거래강도(strength), 수요존/공급존(demand/supply zone), 지지선/저항선
-- In the "summary" section, map indicators to abstract labels:
-  - TSI → "trend" (추세 방향)
-  - RSI → "momentum" (모멘텀)  
-  - Volume → "strength" (거래 강도)
-  - ICT → "zone" (수요·공급 구간)`;
+### TP/SL PLACEMENT
+- SL at BB band levels or recent swing structure (1-2 ATR from entry)
+- TP at opposite BB band or structural target (≥2 ATR)
+- LONG: SL near lower BB / swing low, TP near upper BB
+- SHORT: SL near upper BB / swing high, TP near lower BB
+
+### Volume — CONFIRMATION
+- Rising with trend = continuation. Declining = exhaustion.
+
+## RULES
+1. R:R minimum 1:2 (prefer 1:3+). Below 1:2 → HOLD.
+2. SL at structural level 1-2 ATR. TP1 ≥2 ATR, TP2 ≥3-4 ATR.
+3. Entry: MACD direction + BB filter + VWAP confirmation must align. Otherwise HOLD.
+4. Slope/gap/divergence adjust confidence only, never block entry.
+
+## OUTPUT RULES
+- Entry = current price. No entry zone. Above entry = 저항, below = 지지.
+- All user text in Korean. NEVER mention MACD/BB/Bollinger/VWAP/EMA/SMA/ATR.
+- Use: 추세, 변동성, 거래기준선, 수요존/공급존, 지지선/저항선
+- Summary: MACD→"trend", BB→"volatility", VWAP→"fairValue", Overall→"confluence"`;
 
 const SIMPLE_PROMPT_SUFFIX = `
 
-## OUTPUT FORMAT — SIMPLE MODE (단순 전략)
-Output price ZONES (ranges), NOT exact prices. Each zone has low and high.
-ENTRY IS AT CURRENT PRICE — do NOT provide an entryZone.
-Respond in valid JSON only, no markdown, no backticks:
-{
-  "mode": "simple",
-  "direction": "LONG" or "SHORT" or "HOLD",
-  "confidence": "HIGH" or "MODERATE" or "LOW",
-  "slZone": {"low": <number>, "high": <number>},
-  "tpZone": {"low": <number>, "high": <number>},
-  "riskReward": "<string like 1:2.5>",
-  "idealScenario": "<Korean: ideal scenario description — what the best outcome looks like from current price>",
-  "comment": "<one-line Korean summary, under 80 chars, NO indicator names>",
-  "summary": {
-    "trend": {"signal": "BULLISH"/"BEARISH"/"NEUTRAL", "detail": "<Korean, abstract, no indicator names>"},
-    "momentum": {"signal": "BULLISH"/"BEARISH"/"NEUTRAL", "detail": "<Korean, abstract>"},
-    "strength": {"signal": "BULLISH"/"BEARISH"/"NEUTRAL", "detail": "<Korean, abstract>"},
-    "zone": {"signal": "BULLISH"/"BEARISH"/"NEUTRAL", "detail": "<Korean, describe demand/supply zones abstractly>"}
-  }
-}
+## SIMPLE MODE — JSON only, no markdown:
+{"mode":"simple","direction":"LONG"/"SHORT"/"HOLD","confidence":"HIGH"/"MODERATE"/"LOW",
+"slZone":{"low":N,"high":N},"tpZone":{"low":N,"high":N},"riskReward":"1:X",
+"idealScenario":"<Korean>","comment":"<Korean, <80 chars, no indicator names>",
+"summary":{"trend":{"signal":"BULLISH"/"BEARISH"/"NEUTRAL","detail":"<Korean>"},
+"volatility":{"signal":"...","detail":"..."},"fairValue":{"signal":"...","detail":"..."},
+"confluence":{"signal":"...","detail":"..."}}}
 
-ZONE RULES:
-- Each zone width should be ~0.5~1.5% of price (e.g. price 68,300 → zone 67,900~68,700)
-- For LONG: tpZone is ABOVE current price, slZone is BELOW current price
-- For SHORT: tpZone is BELOW current price, slZone is ABOVE current price
-- NEVER output a single exact price — always a low/high range
-- In "detail" fields and "comment", use ONLY abstract Korean terms.
-- Good: "상승 추세 전환 초기 단계", "과매도 구간에서 반등 기대"
-- Bad: "TSI가 시그널 라인 위로 상승", "RSI 35.5로 과매도"`;
+SL at BB/structural level (1-2 ATR). TP at structural level (≥2x SL). R:R<1:2→HOLD. Zones as low/high.`;
 
 const STRATEGIC_PROMPT_SUFFIX = `
 
-## OUTPUT FORMAT — COMPLEX MODE (복합 전략)
-Provide 2 TPs + 2 SLs with BRANCHING scenarios (tree structure). ENTRY IS AT CURRENT PRICE (즉시 진입).
-Label all levels relative to entry: above entry = 저항, below entry = 지지.
-Respond in valid JSON only:
-{
-  "mode": "strategic",
-  "direction": "LONG" or "SHORT" or "HOLD",
-  "confidence": "HIGH" or "MODERATE" or "LOW",
-  "idealScenario": "<Korean: ideal scenario description — what the best outcome looks like from current price. Be specific with key price levels.>",
-  "levels": {
-    "tp1Zone": {"low": <number>, "high": <number>},
-    "tp2Zone": {"low": <number>, "high": <number>},
-    "sl1Zone": {"low": <number>, "high": <number>},
-    "sl2Zone": {"low": <number>, "high": <number>}
-  },
-  "scenarios": {
-    "profitPath": {
-      "name": "익절 경로",
-      "probability": "<total probability for this path, e.g. 65%>",
-      "trigger": {"label": "1차 익절", "price": <tp1Zone midpoint>, "pct": "(50%)"},
-      "outcomes": [
-        {
-          "name": "본전 청산",
-          "probability": "<e.g. 30%>",
-          "type": "breakeven",
-          "step": {"label": "본전", "price": <current price>, "pct": "(50%)"},
-          "description": "<Korean: brief description of this outcome>"
-        },
-        {
-          "name": "2차 익절",
-          "probability": "<e.g. 35%>",
-          "type": "tp",
-          "step": {"label": "2차 익절", "price": <tp2Zone midpoint>, "pct": "(50%)"},
-          "description": "<Korean: brief description>"
-        }
-      ]
-    },
-    "lossPath": {
-      "name": "손절 경로",
-      "probability": "<total probability for this path, e.g. 35%>",
-      "trigger": {"label": "1차 손절", "price": <sl1Zone midpoint>, "pct": "(50%)"},
-      "outcomes": [
-        {
-          "name": "1차 익절 회복",
-          "probability": "<e.g. 20%>",
-          "type": "tp",
-          "step": {"label": "1차 익절", "price": <tp1Zone midpoint>, "pct": "(50%)"},
-          "description": "<Korean: brief description>"
-        },
-        {
-          "name": "2차 손절",
-          "probability": "<e.g. 15%>",
-          "type": "sl",
-          "step": {"label": "2차 손절", "price": <sl2Zone midpoint>, "pct": "(50%)"},
-          "description": "<Korean: brief description>"
-        }
-      ]
-    }
-  },
-  "exitStrategy": {
-    "partialExit": "<Korean: when to take partial profit>",
-    "fullExit": "<Korean: when to close entire position>",
-    "trailingStop": "<Korean: trailing stop description>"
-  },
-  "comment": "<Korean summary of strategy, under 120 chars, NO indicator names>",
-  "summary": {
-    "trend": {"signal": "BULLISH"/"BEARISH"/"NEUTRAL", "detail": "<Korean, abstract>"},
-    "momentum": {"signal": "BULLISH"/"BEARISH"/"NEUTRAL", "detail": "<Korean, abstract>"},
-    "strength": {"signal": "BULLISH"/"BEARISH"/"NEUTRAL", "detail": "<Korean, abstract>"},
-    "zone": {"signal": "BULLISH"/"BEARISH"/"NEUTRAL", "detail": "<Korean, describe demand/supply zones>"}
-  }
-}
+## COMPLEX MODE — JSON only, no markdown:
+{"mode":"strategic","direction":"LONG"/"SHORT"/"HOLD","confidence":"HIGH"/"MODERATE"/"LOW",
+"idealScenario":"<Korean>",
+"levels":{"tp1Zone":{"low":N,"high":N},"tp2Zone":{"low":N,"high":N},"sl1Zone":{"low":N,"high":N},"sl2Zone":{"low":N,"high":N}},
+"scenarios":{
+  "profitPath":{"name":"익절 경로","probability":"X%",
+    "trigger":{"label":"1차 익절","price":N,"pct":"(50%)"},
+    "outcomes":[
+      {"name":"1차 손절","probability":"X%","type":"sl","step":{"label":"1차 손절","price":N,"pct":"(50%)"},"description":"<Korean>"},
+      {"name":"2차 익절","probability":"X%","type":"tp","step":{"label":"2차 익절","price":N,"pct":"(50%)"},"description":"<Korean>"}]},
+  "lossPath":{"name":"손절 경로","probability":"X%",
+    "trigger":{"label":"1차 손절","price":N,"pct":"(50%)"},
+    "outcomes":[
+      {"name":"2차 익절 회복","probability":"X%","type":"tp","step":{"label":"2차 익절","price":N,"pct":"(50%)"},"description":"<Korean>"},
+      {"name":"2차 손절","probability":"X%","type":"sl","step":{"label":"2차 손절","price":N,"pct":"(50%)"},"description":"<Korean>"}]}},
+"exitStrategy":{"partialExit":"<Korean>","fullExit":"<Korean>","trailingStop":"<Korean>"},
+"comment":"<Korean, <120 chars>",
+"summary":{"trend":{...},"volatility":{...},"fairValue":{...},"confluence":{...}}}
 
-## BRANCHING SCENARIO RULES:
-The scenarios use a TREE structure with 2 main paths, each branching into 2 outcomes.
+TREE: PATH1: Entry→TP1(50%)→SL1 or TP2. PATH2: Entry→SL1(50%)→TP2 or SL2.
+Probs: paths sum 100%, all 4 outcomes sum≈100%.
+SL1≈1-1.5ATR, SL2≈2-3ATR, TP1≥2ATR, TP2≥3-4ATR. BB-guided placement. No SL→HOLD. HOLD→null.
+LONG: tp1<tp2 above, sl1>sl2 below. SHORT: opposite. Labels: above=저항, below=지지.`;
 
-PATH 1 — 익절 경로 (Profit Path):
-  Entry (100%) → price hits TP1 first → exit 50% at TP1 (1차 익절)
-    ├→ price returns to entry → exit remaining 50% at break-even (본전)
-    └→ price continues to TP2 → exit remaining 50% at TP2 (2차 익절)
-
-PATH 2 — 손절 경로 (Loss Path):
-  Entry (100%) → price hits SL1 first → exit 50% at SL1 (1차 손절)
-    ├→ price recovers to TP1 → exit remaining 50% at TP1 (1차 익절 회복)
-    └→ price continues to SL2 → exit remaining 50% at SL2 (2차 손절)
-
-PROBABILITY RULES:
-- profitPath.probability + lossPath.probability = 100%
-- Within each path: the two outcome probabilities should sum to the path's total probability
-- Example: profitPath 65% (breakeven 30% + tp2 35%), lossPath 35% (recovery 20% + sl2 15%)
-- All 4 outcome probabilities should sum to ~100%
-
-## LABEL RULES (CRITICAL):
-- Levels ABOVE entry price → 저항 (resistance): 1차 저항, 2차 저항
-- Levels BELOW entry price → 지지 (support): 1차 지지, 2차 지지
-- For LONG: tp1/tp2 are above entry → "1차 저항", "2차 저항"; sl1/sl2 are below → "1차 지지", "2차 지지"
-- For SHORT: tp1/tp2 are below entry → "1차 지지", "2차 지지"; sl1/sl2 are above → "1차 저항", "2차 저항"
-- In the PRICE LEVELS section, use 저항/지지 labels
-- In the SCENARIO FLOWS, use 익절/손절/본전 labels (these describe trading actions)
-
-COMPLEX MODE RULES:
-- ALL prices must be expressed as zones (low/high), NOT single numbers
-- Zone width: ~0.5~1.5% of price for crypto, ~0.3~0.8% for stocks
-- For LONG: tp1Zone < tp2Zone (both above current), sl1Zone > sl2Zone (both below current)
-- For SHORT: tp1Zone > tp2Zone (both below current), sl1Zone < sl2Zone (both above current)
-- Use midpoint of each zone for scenario flow prices.
-- If direction is HOLD: set levels to null, scenarios to null.
-- NEVER use TSI/RSI/ICT/OB/FVG/BOS in user-facing text — use abstract Korean terms only`;
-
-// ── Indicator calculations ──
-function calcRSI(closes, length = 21) {
-  if (closes.length < length + 1) return [];
-  const r = [];
-  let gAvg = 0, lAvg = 0;
-  for (let i = 1; i <= length; i++) {
-    const ch = closes[i] - closes[i-1];
-    if (ch > 0) gAvg += ch; else lAvg += Math.abs(ch);
-  }
-  gAvg /= length; lAvg /= length;
-  for (let i = 0; i <= length; i++) r.push(null);
-  r[length] = lAvg === 0 ? 100 : 100 - 100 / (1 + gAvg / lAvg);
-  for (let i = length + 1; i < closes.length; i++) {
-    const ch = closes[i] - closes[i-1];
-    const g = ch > 0 ? ch : 0, l = ch < 0 ? Math.abs(ch) : 0;
-    gAvg = (gAvg * (length-1) + g) / length;
-    lAvg = (lAvg * (length-1) + l) / length;
-    r.push(lAvg === 0 ? 100 : 100 - 100 / (1 + gAvg / lAvg));
-  }
-  return r;
-}
+// ── Calculations ──
 
 function calcSMA(vals, len) {
   return vals.map((_, i) => {
@@ -252,15 +141,107 @@ function calcEMA(vals, len) {
   return r;
 }
 
-function calcTSI(closes, long = 13, short = 8, sig = 8) {
-  if (closes.length < long + short + 2) return { tsi: [], signal: [] };
-  const ch = [null, ...closes.slice(1).map((c, i) => c - closes[i])];
-  const absCh = ch.map(c => c === null ? null : Math.abs(c));
-  const ds = calcEMA(calcEMA(ch, long), short);
-  const ads = calcEMA(calcEMA(absCh, long), short);
-  const tsi = ds.map((d, i) => d === null || ads[i] === null || ads[i] === 0 ? null : 100 * d / ads[i]);
-  return { tsi, signal: calcEMA(tsi, sig) };
+function calcMACD(closes) {
+  const ema12 = calcEMA(closes, 12);
+  const ema26 = calcEMA(closes, 26);
+  const macd = ema12.map((v, i) => (v !== null && ema26[i] !== null) ? v - ema26[i] : null);
+  const signal = calcEMA(macd, 9);
+  const histogram = macd.map((v, i) => (v !== null && signal[i] !== null) ? v - signal[i] : null);
+  return { macd, signal, histogram };
 }
+
+function calcBB(closes, len = 20, mult = 2) {
+  const middle = calcSMA(closes, len);
+  const upper = [], lower = [], width = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (middle[i] === null) { upper.push(null); lower.push(null); width.push(null); continue; }
+    let sumSq = 0;
+    for (let j = i - len + 1; j <= i; j++) sumSq += (closes[j] - middle[i]) ** 2;
+    const std = Math.sqrt(sumSq / len);
+    upper.push(middle[i] + mult * std);
+    lower.push(middle[i] - mult * std);
+    width.push(mult * 2 * std / middle[i] * 100);
+  }
+  return { middle, upper, lower, width };
+}
+
+function calcVWAP(candles) {
+  const vwap = [];
+  let cumTPV = 0, cumVol = 0;
+  for (const c of candles) {
+    const tp = (c.high + c.low + c.close) / 3;
+    cumTPV += tp * (c.volume || 0);
+    cumVol += (c.volume || 0);
+    vwap.push(cumVol > 0 ? cumTPV / cumVol : null);
+  }
+  return vwap;
+}
+
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return [];
+  const trs = [null];
+  for (let i = 1; i < candles.length; i++) {
+    const h = candles[i].high, l = candles[i].low, pc = candles[i-1].close;
+    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+  }
+  let sum = 0;
+  for (let i = 1; i <= period; i++) sum += trs[i];
+  const atr = new Array(period).fill(null);
+  atr.push(sum / period);
+  for (let i = period + 1; i < trs.length; i++) {
+    atr.push((atr[i-1] * (period - 1) + trs[i]) / period);
+  }
+  return atr;
+}
+
+function calcSlope(values, lookback = 5) {
+  const recent = values.slice(-lookback).filter(v => v !== null);
+  if (recent.length < 3) return null;
+  const n = recent.length;
+  let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+  for (let i = 0; i < n; i++) { sumX += i; sumY += recent[i]; sumXY += i * recent[i]; sumX2 += i * i; }
+  return (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+}
+
+function calcGapTrend(primary, secondary, lookback = 5) {
+  const gaps = [];
+  const start = Math.max(primary.length - lookback, 0);
+  for (let i = start; i < primary.length; i++) {
+    if (primary[i] !== null && secondary[i] !== null) gaps.push(primary[i] - secondary[i]);
+  }
+  if (gaps.length < 3) return { direction: 'unknown', consecutive: 0 };
+  let narrowing = 0, widening = 0;
+  for (let i = 1; i < gaps.length; i++) {
+    if (Math.abs(gaps[i]) < Math.abs(gaps[i-1])) narrowing++; else widening++;
+  }
+  if (narrowing > widening) return { direction: 'narrowing', consecutive: narrowing };
+  if (widening > narrowing) return { direction: 'widening', consecutive: widening };
+  return { direction: 'stable', consecutive: 0 };
+}
+
+function detectDivergence(closes, indicator, lookback = 30) {
+  const len = closes.length, start = Math.max(len - lookback, 2);
+  let pH = [], pL = [], iH = [], iL = [];
+  for (let i = start; i < len - 1; i++) {
+    if (closes[i] === null || indicator[i] === null) continue;
+    if (closes[i] > closes[i-1] && closes[i] > closes[i+1]) pH.push({ v: closes[i] });
+    if (indicator[i] > indicator[i-1] && indicator[i] > indicator[i+1]) iH.push({ v: indicator[i] });
+    if (closes[i] < closes[i-1] && closes[i] < closes[i+1]) pL.push({ v: closes[i] });
+    if (indicator[i] < indicator[i-1] && indicator[i] < indicator[i+1]) iL.push({ v: indicator[i] });
+  }
+  let bearish = false, bullish = false;
+  if (pH.length >= 2 && iH.length >= 2) {
+    const a = pH.slice(-2), b = iH.slice(-2);
+    if (a[1].v > a[0].v && b[1].v < b[0].v) bearish = true;
+  }
+  if (pL.length >= 2 && iL.length >= 2) {
+    const a = pL.slice(-2), b = iL.slice(-2);
+    if (a[1].v < a[0].v && b[1].v > b[0].v) bullish = true;
+  }
+  return { bearish, bullish };
+}
+
+// ── Handler ──
 
 exports.handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers, body: '' };
@@ -269,21 +250,56 @@ exports.handler = async (event) => {
   if (!CLAUDE_API_KEY) return { statusCode: 500, headers, body: JSON.stringify({ error: 'API 키가 설정되지 않았습니다.' }) };
 
   try {
-    const body = JSON.parse(event.body || '{}');
+    const rawBody = event.body || '{}';
+    const body = JSON.parse(rawBody);
     const { candles, symbol, timeframe, mode } = body;
     const isStrategic = mode === 'strategic';
 
     if (!candles || candles.length < 30) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: '최소 30개 이상의 캔들이 필요합니다.' }) };
+      return { statusCode: 200, headers, body: JSON.stringify({ error: `캔들 부족: ${candles ? candles.length : 0}개 수신 (최소 30개 필요). bodySize=${rawBody.length}` }) };
     }
 
     const closes = candles.map(c => c.close);
     const volumes = candles.map(c => c.volume);
-    const rsiValues = calcRSI(closes, 21);
-    const rsiSMA = calcSMA(rsiValues, 21);
-    const tsiData = calcTSI(closes, 13, 8, 8);
     const last = closes.length - 1;
     const currentPrice = closes[last];
+
+    // Indicators
+    const macdData = calcMACD(closes);
+    const bbData = calcBB(closes, 20, 2);
+    const vwapData = calcVWAP(candles);
+    const atrValues = calcATR(candles, 14);
+
+    const currentATR = atrValues[last];
+    const atrPct = currentATR ? (currentATR / currentPrice * 100).toFixed(2) : null;
+
+    const macdVal = macdData.macd[last];
+    const macdSig = macdData.signal[last];
+    const macdHist = macdData.histogram[last];
+    const prevHist = macdData.histogram[last - 1];
+    const bbMid = bbData.middle[last];
+    const bbUp = bbData.upper[last];
+    const bbLow = bbData.lower[last];
+    const bbW = bbData.width[last];
+    const vwapVal = vwapData[last];
+
+    // BB filter
+    const bbFilter = bbMid
+      ? (currentPrice > bbMid ? 'ABOVE BB Middle → LONG only' : 'BELOW BB Middle → SHORT only')
+      : 'N/A';
+    const bbMidPct = bbMid ? ((currentPrice - bbMid) / bbMid * 100).toFixed(2) : null;
+    const bbPosition = (bbUp && bbLow) ? ((currentPrice - bbLow) / (bbUp - bbLow) * 100).toFixed(1) : null;
+
+    // VWAP
+    const vwapPct = vwapVal ? ((currentPrice - vwapVal) / vwapVal * 100).toFixed(2) : null;
+
+    // Health metrics
+    const macdSlope = calcSlope(macdData.histogram, 5);
+    const bbMidSlope = calcSlope(bbData.middle, 5);
+    const macdGap = calcGapTrend(macdData.macd, macdData.signal, 5);
+    const macdDiv = detectDivergence(closes, macdData.histogram, 30);
+
+    const sl = (s) => s === null ? 'N/A' : s > 0.001 ? 'rising' : s < -0.001 ? 'falling' : 'flat';
 
     const recentCandles = candles.slice(-50).map((c, i) => ({
       idx: candles.length - 50 + i, t: c.time,
@@ -293,38 +309,38 @@ exports.handler = async (event) => {
     const avgVol = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
     const recVol = volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
 
-    const prompt = `Analyze this ${symbol} ${timeframe} chart. Mode: ${isStrategic ? 'COMPLEX (복합 전략 — 4 scenarios with split positions)' : 'SIMPLE (단순 전략 — single TP/SL)'}.
+    const prompt = `Analyze ${symbol} ${timeframe}. Mode: ${isStrategic ? 'COMPLEX' : 'SIMPLE'}.
 
-CURRENT PRICE (즉시 진입 기준): ${currentPrice}
+PRICE: ${currentPrice}
+ATR(14): ${currentATR?.toFixed(2) || 'N/A'} (${atrPct || 'N/A'}%)
 
-CURRENT PRIMARY INDICATORS:
-- TSI(13,8,8): ${tsiData.tsi[last]?.toFixed(2) || 'N/A'}
-- TSI Signal(8): ${tsiData.signal[last]?.toFixed(2) || 'N/A'}
-- TSI vs Signal: ${tsiData.tsi[last] && tsiData.signal[last] ? (tsiData.tsi[last] > tsiData.signal[last] ? 'TSI ABOVE Signal (Bullish)' : 'TSI BELOW Signal (Bearish)') : 'N/A'}
-- RSI(21): ${rsiValues[last]?.toFixed(2) || 'N/A'}
-- RSI SMA(21): ${rsiSMA[last]?.toFixed(2) || 'N/A'}
-- RSI vs SMA: ${rsiValues[last] && rsiSMA[last] ? (rsiValues[last] > rsiSMA[last] ? 'RSI ABOVE SMA (Bullish)' : 'RSI BELOW SMA (Bearish)') : 'N/A'}
+BB FILTER (MANDATORY):
+- BB Middle: ${bbMid?.toFixed(2) || 'N/A'}
+- BB Upper: ${bbUp?.toFixed(2) || 'N/A'}
+- BB Lower: ${bbLow?.toFixed(2) || 'N/A'}
+- BB Width: ${bbW?.toFixed(2) || 'N/A'}% ${bbW && bbW < 3 ? '⚠ SQUEEZE — breakout imminent' : ''}
+- ${bbFilter} (${bbMidPct ? bbMidPct + '% from BB Mid' : 'N/A'})
+- Band Position: ${bbPosition || 'N/A'}% (0=lower, 100=upper)
+- ABOVE BB Mid = only LONG. BELOW BB Mid = only SHORT. Violation = HOLD.
 
-SUPPLEMENTARY:
-- Avg Volume(20): ${avgVol.toFixed(0)}
-- Recent Volume(5): ${recVol.toFixed(0)}
-- Volume Trend: ${recVol > avgVol * 1.2 ? 'INCREASING' : recVol < avgVol * 0.8 ? 'DECREASING' : 'STABLE'}
+MACD(12,26,9): ${macdVal?.toFixed(4) || 'N/A'} | Signal: ${macdSig?.toFixed(4) || 'N/A'} | ${macdVal && macdSig ? (macdVal > macdSig ? 'ABOVE Signal' : 'BELOW Signal') : 'N/A'} | Zero: ${macdVal ? (macdVal > 0 ? 'ABOVE(bull)' : 'BELOW(bear)') : 'N/A'}
+Histogram: ${macdHist?.toFixed(4) || 'N/A'} | Prev: ${prevHist?.toFixed(4) || 'N/A'} | Flip: ${macdHist && prevHist ? (Math.sign(macdHist) !== Math.sign(prevHist) ? 'YES — ENTRY TRIGGER' : 'NO') : 'N/A'}
+MACD health: hist slope ${sl(macdSlope)}(${macdSlope?.toFixed(4)}), gap ${macdGap.direction}, div: ${macdDiv.bearish ? 'BEARISH' : macdDiv.bullish ? 'BULLISH' : 'none'}
 
-RECENT 50 CANDLES (OHLCV):
+VWAP: ${vwapVal?.toFixed(2) || 'N/A'} | ${vwapVal ? (currentPrice > vwapVal ? 'ABOVE (Buyers)' : 'BELOW (Sellers)') : 'N/A'} | ${vwapPct ? vwapPct + '% from VWAP' : 'N/A'}
+
+Vol: avg20=${avgVol.toFixed(0)} rec5=${recVol.toFixed(0)} ${recVol > avgVol * 1.2 ? 'UP' : recVol < avgVol * 0.8 ? 'DOWN' : 'STABLE'}
+
+CANDLES(50):
 ${JSON.stringify(recentCandles)}
 
-Recent TSI (last 10): ${tsiData.tsi.slice(-10).map(v => v?.toFixed(2)).join(', ')}
-Recent TSI Signal (last 10): ${tsiData.signal.slice(-10).map(v => v?.toFixed(2)).join(', ')}
-Recent RSI (last 10): ${rsiValues.slice(-10).map(v => v?.toFixed(2)).join(', ')}
+MACD Hist(10): ${macdData.histogram.slice(-10).map(v => v?.toFixed(4)).join(',')}
+BB Mid(5): ${bbData.middle.slice(-5).map(v => v?.toFixed(2)).join(',')}
+BB Up(5): ${bbData.upper.slice(-5).map(v => v?.toFixed(2)).join(',')}
+BB Low(5): ${bbData.lower.slice(-5).map(v => v?.toFixed(2)).join(',')}
 
-CRITICAL REMINDERS:
-1. ENTRY IS AT CURRENT PRICE (${currentPrice}). Do NOT provide an entryZone. Entry is immediate.
-2. In ALL user-facing text, NEVER use technical indicator names. Use abstract Korean terms only.
-3. Label levels relative to entry: above entry = 저항, below entry = 지지.
-4. For LONG: TP above → 저항, SL below → 지지. For SHORT: TP below → 지지, SL above → 저항.
-5. Provide idealScenario describing the best expected outcome from current price.
-
-Respond as JSON only.`;
+RULES: Entry=${currentPrice}. No indicator names in text. Above=저항,below=지지. R:R<1:2→HOLD. Entry: MACD+BB+VWAP 3가지 방향 일치→진입, 불일치→HOLD. Slope/gap/divergence는 신뢰도만 조절. SL at BB/structural levels.
+JSON only.`;
 
     const systemPrompt = SYSTEM_BASE + (isStrategic ? STRATEGIC_PROMPT_SUFFIX : SIMPLE_PROMPT_SUFFIX);
 
@@ -359,12 +375,13 @@ Respond as JSON only.`;
       return { statusCode: 200, headers, body: JSON.stringify({ error: 'AI 응답 파싱 실패', raw: textContent.substring(0, 500) }) };
     }
 
-    // Inject current price and calculated indicators
     analysis.currentPrice = currentPrice;
     analysis.calculatedIndicators = {
-      rsi: rsiValues[last], rsiSMA: rsiSMA[last],
-      tsi: tsiData.tsi[last], tsiSignal: tsiData.signal[last],
-      avgVolume: avgVol, recentVolume: recVol
+      macd: macdVal, macdSignal: macdSig, macdHistogram: macdHist,
+      bbUpper: bbUp, bbMiddle: bbMid, bbLower: bbLow, bbWidth: bbW ? parseFloat(bbW.toFixed(2)) : null,
+      vwap: vwapVal, atr: currentATR, atrPct: atrPct ? parseFloat(atrPct) : null,
+      avgVolume: avgVol, recentVolume: recVol,
+      trendHealth: { macdSlope, bbMidSlope, macdGap, macdDiv }
     };
 
     return { statusCode: 200, headers, body: JSON.stringify(analysis) };
