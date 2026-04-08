@@ -165,14 +165,17 @@ function calcBB(closes, len = 20, mult = 2) {
   return { middle, upper, lower, width };
 }
 
-function calcVWAP(candles) {
+function calcVWAP(candles, period = 20) {
   const vwap = [];
-  let cumTPV = 0, cumVol = 0;
-  for (const c of candles) {
-    const tp = (c.high + c.low + c.close) / 3;
-    cumTPV += tp * (c.volume || 0);
-    cumVol += (c.volume || 0);
-    vwap.push(cumVol > 0 ? cumTPV / cumVol : null);
+  for (let i = 0; i < candles.length; i++) {
+    const start = Math.max(0, i - period + 1);
+    let sumTPV = 0, sumVol = 0;
+    for (let j = start; j <= i; j++) {
+      const tp = (candles[j].high + candles[j].low + candles[j].close) / 3;
+      sumTPV += tp * (candles[j].volume || 0);
+      sumVol += (candles[j].volume || 0);
+    }
+    vwap.push(sumVol > 0 ? sumTPV / sumVol : null);
   }
   return vwap;
 }
