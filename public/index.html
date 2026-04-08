@@ -104,14 +104,13 @@ tr:hover td{background:rgba(245,158,11,.03)}
 <body>
 <div class="topbar">
   <div class="topbar-logo">RFF Backtest <span>자동 순차 시뮬레이션</span></div>
-  <div class="topbar-right"><span class="topbar-badge">MACD · BB · VWAP</span></div>
+  <div class="topbar-right"><span class="topbar-badge">HMA100 · TSI(21,21,21)</span><span class="topbar-limit">최대 10회</span></div>
 </div>
 <div class="config">
   <div class="config-row">
     <div class="cfg cfg-symbol"><label>종목</label><input type="text" id="symbolInput" placeholder="심볼 검색" spellcheck="false" autocomplete="off"><div class="search-dropdown" id="searchDropdown"></div></div>
     <div class="cfg"><label>타임프레임</label><select id="tfSelect"><option value="1h">1시간</option><option value="4h">4시간</option><option value="1d" selected>일봉</option><option value="1wk">주봉</option></select></div>
     <div class="cfg cfg-date"><label>📅 시작일</label><input type="date" id="startDate"></div>
-    <div class="cfg"><label>전략</label><select id="modeSelect"><option value="simple" selected>단순 (빠름)</option><option value="strategic">복합 (느림)</option></select></div>
     <button class="btn-run" id="btnRun" onclick="startBacktest()">백테스트 실행</button>
     <button class="btn-stop" id="btnStop" onclick="stopBacktest()">중지</button>
   </div>
@@ -119,7 +118,6 @@ tr:hover td{background:rgba(245,158,11,.03)}
     <div class="cfg cfg-small"><label>초기 자본 (만원)</label><input type="number" id="initCapital" value="1000"></div>
     <div class="cfg cfg-small"><label>수수료 (%)</label><input type="number" id="commission" value="0.1" step="0.01"></div>
     <div class="cfg cfg-small"><label>슬리피지 (%)</label><input type="number" id="slippage" value="0.05" step="0.01"></div>
-    <div class="cfg cfg-small"><label>최대 거래 수</label><input type="number" id="maxTrades" value="10" min="1" max="999"></div>
     <div class="cfg"><label>벤치마크</label><select id="benchmark"><option value="SPY">S&P 500 (SPY)</option><option value="^KS11">KOSPI</option><option value="QQQ">NASDAQ (QQQ)</option><option value="BTC-USD">비트코인</option></select></div>
   </div>
 </div>
@@ -137,6 +135,7 @@ tr:hover td{background:rgba(245,158,11,.03)}
 
 <script>
 const API='/.netlify/functions';
+const MAX_TRADES=10;
 let running=false,cancelled=false,currentMarket='us_stock',searchTimeout=null,eqChart=null,ddChart=null;
 
 (function(){const d=new Date();d.setMonth(d.getMonth()-6);document.getElementById('startDate').value=d.toISOString().split('T')[0];})();
@@ -162,11 +161,10 @@ function setProgress(p,t,d){document.getElementById('progressBar').style.width=p
 function hideResults(){['conditionsBox','statsWrap','chartsWrap','monthlyWrap','oosWrap','logOuter'].forEach(id=>document.getElementById(id).style.display='none');['monthlyTitle','oosTitle','logTitle'].forEach(id=>document.getElementById(id).style.display='none');}
 
 async function startBacktest(){
-  const symbol=symInput.value.trim().toUpperCase(),tf=document.getElementById('tfSelect').value,startDate=document.getElementById('startDate').value,mode=document.getElementById('modeSelect').value;
+  const symbol=symInput.value.trim().toUpperCase(),tf=document.getElementById('tfSelect').value,startDate=document.getElementById('startDate').value;
   const initCap=parseFloat(document.getElementById('initCapital').value)||1000;
   const commPct=parseFloat(document.getElementById('commission').value)||0,slipPct=parseFloat(document.getElementById('slippage').value)||0;
   const costPct=(commPct+slipPct)*2,benchSym=document.getElementById('benchmark').value;
-  const MAX_TRADES=parseInt(document.getElementById('maxTrades').value)||10;
   if(!symbol)return alert('종목을 입력하세요');if(!startDate)return alert('시작일을 선택하세요');
 
   running=true;cancelled=false;document.getElementById('btnRun').disabled=true;document.getElementById('btnStop').style.display='inline-block';
@@ -174,10 +172,10 @@ async function startBacktest(){
 
   try{
     const allCandles=await fetchCandles(symbol,currentMarket,tf);
-    if(!allCandles||allCandles.length<50){setProgress(0,'데이터 부족',`${allCandles?.length||0}개`);finish();return;}
+    if(!allCandles||allCandles.length<120){setProgress(0,'데이터 부족 (HMA100 최소 120봉)',`${allCandles?.length||0}개`);finish();return;}
 
     const startUnix=new Date(startDate+'T00:00:00Z').getTime()/1000;
-    let startIdx=allCandles.findIndex(c=>c.time>=startUnix);if(startIdx<0)startIdx=0;if(startIdx<30)startIdx=30;
+    let startIdx=allCandles.findIndex(c=>c.time>=startUnix);if(startIdx<0)startIdx=0;if(startIdx<110)startIdx=110;
     const totalBars=allCandles.length-startIdx;
     setProgress(0,`${totalBars}봉 시뮬레이션`,`${symbol} ${tf}`);
 
@@ -191,7 +189,7 @@ async function startBacktest(){
 
       const wStart=Math.max(0,idx-499),wCandles=allCandles.slice(wStart,idx+1);
       let analysis;
-      try{analysis=await callAnalyze(wCandles,symbol,tf,mode);}catch(e){setProgress(pct,'API 오류 — 5초 후 재시도',e.message);await sleep(5000);continue;}
+      try{analysis=await callAnalyze(wCandles,symbol,tf);}catch(e){setProgress(pct,'API 오류 — 5초 후 재시도',e.message);await sleep(5000);continue;}
       dbgTotal++;
       if(!analysis||analysis.error){dbgErr++;idx++;continue;}
 
@@ -199,8 +197,7 @@ async function startBacktest(){
       holdStreak=0;
 
       const dir=analysis.direction,entryPrice=allCandles[idx].close,entryTime=allCandles[idx].time;
-      let tpZone,slZone;
-      if(analysis.mode==='strategic'&&analysis.levels){tpZone=analysis.levels.tp1Zone;slZone=analysis.levels.sl1Zone;}else{tpZone=analysis.tpZone;slZone=analysis.slZone;}
+      let tpZone=analysis.tpZone,slZone=analysis.slZone;
       if(!tpZone||!slZone){dbgNoZone++;idx++;continue;}
 
       let exitIdx=null,exitPrice=null,exitType=null;
@@ -226,7 +223,7 @@ async function startBacktest(){
 
     let benchCandles=null;try{benchCandles=await fetchCandles(benchSym,'us_stock',tf);}catch{}
     let cum=0;trades.forEach(t=>{cum+=t.pnlPct;t._cum=+cum.toFixed(2);});
-    displayAll(trades,allCandles,startIdx,benchCandles,benchSym,{symbol,tf,startDate,mode,initCap,commPct,slipPct,costPct,MAX_TRADES});
+    displayAll(trades,allCandles,startIdx,benchCandles,benchSym,{symbol,tf,startDate,initCap,commPct,slipPct,costPct});
   }catch(err){setProgress(0,'오류',err.message);}
   finish();
 }
@@ -234,7 +231,7 @@ function stopBacktest(){cancelled=true;}
 function finish(){running=false;document.getElementById('btnRun').disabled=false;document.getElementById('btnStop').style.display='none';}
 
 async function fetchCandles(sym,mkt,tf){const r=await fetch(API+'/yahoo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,market:mkt,timeframe:tf})});const d=await r.json();if(d.error)throw new Error(d.error);return d.candles||[];}
-async function callAnalyze(candles,sym,tf,mode){const r=await fetch(API+'/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candles,symbol:sym,timeframe:tf,mode})});return await r.json();}
+async function callAnalyze(candles,sym,tf){const r=await fetch(API+'/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candles,symbol:sym,timeframe:tf})});return await r.json();}
 
 // ═══ DISPLAY ═══
 function displayAll(trades,candles,startIdx,benchCandles,benchSym,cfg){
@@ -247,13 +244,13 @@ function showConditions(trades,cfg){
     <div class="cond-item"><strong>종목:</strong> ${cfg.symbol}</div>
     <div class="cond-item"><strong>타임프레임:</strong> ${cfg.tf}</div>
     <div class="cond-item"><strong>테스트 기간:</strong> ${trades[0].entryDate} ~ ${trades[trades.length-1].exitDate}</div>
-    <div class="cond-item"><strong>총 거래:</strong> ${trades.length}건 / ${cfg.MAX_TRADES}회 제한</div>
+    <div class="cond-item"><strong>총 거래:</strong> ${trades.length}건 / ${MAX_TRADES}회 제한</div>
     <div class="cond-item"><strong>초기 자본:</strong> ${cfg.initCap.toLocaleString()}만원</div>
     <div class="cond-item"><strong>수수료:</strong> ${cfg.commPct}% (편도)</div>
     <div class="cond-item"><strong>슬리피지:</strong> ${cfg.slipPct}% (편도)</div>
     <div class="cond-item"><strong>왕복 비용:</strong> ${cfg.costPct.toFixed(2)}%</div>
-    <div class="cond-item"><strong>전략:</strong> ${cfg.mode==='simple'?'단순':'복합'} (MACD+BB+VWAP)</div>
-    <div class="cond-item"><strong>진입:</strong> 종가 즉시 진입</div>
+    <div class="cond-item"><strong>전략:</strong> HMA(100) + TSI(21,21,21)</div>
+    <div class="cond-item"><strong>청산:</strong> ATR(21) TP×2.5 / SL×2.0</div>
   </div>`;
 }
 
