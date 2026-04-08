@@ -1,6 +1,8 @@
-// netlify/functions/analyze.js v5.0
-// Backtest: MACD(12,26,9) + Bollinger Bands(20,2) + VWAP + ATR(14)
-// Three non-overlapping axes: Trend(MACD) + Volatility(BB) + FairValue(VWAP)
+// netlify/functions/analyze.js v6.0
+// Deterministic backtest engine: MACD + BB + VWAP → direction, ATR + BB → TP/SL
+// AI (Claude) provides Korean commentary ONLY — no price generation
+// TF-adaptive parameters: 1h / 4h / 1d / 1wk
+// Direction: 2/3 majority vote (MACD direction, BB position, VWAP position)
 
 const headers = {
   'Content-Type': 'application/json',
@@ -9,116 +11,37 @@ const headers = {
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
 };
 
-const SYSTEM_BASE = `You are a technical analyst. Core: CUT LOSSES SHORT, LET WINNERS RUN.
+// ══════════════════════════════════════════════
+// TF-ADAPTIVE PARAMETERS
+// ══════════════════════════════════════════════
 
-## INDICATORS
+const TF_PARAMS = {
+  '1h':  { macdFast:8,  macdSlow:17, macdSig:9, bbLen:14, bbMult:2.0, atrLen:10, vwapMode:'session', squeezePct:4.0, slopeLook:5, divLook:20 },
+  '4h':  { macdFast:12, macdSlow:26, macdSig:9, bbLen:20, bbMult:2.0, atrLen:14, vwapMode:'cumulative', squeezePct:3.0, slopeLook:5, divLook:30 },
+  '1d':  { macdFast:8,  macdSlow:17, macdSig:9, bbLen:14, bbMult:2.0, atrLen:14, vwapMode:'rolling50', squeezePct:2.5, slopeLook:5, divLook:30 },
+  '1wk': { macdFast:12, macdSlow:26, macdSig:9, bbLen:20, bbMult:2.5, atrLen:10, vwapMode:'cumulative', squeezePct:2.0, slopeLook:8, divLook:40 }
+};
 
-### MACD (12,26,9) — PRIORITY 1: Direction
-- MACD Line = EMA(12) - EMA(26)
-- Signal Line = EMA(MACD, 9)
-- Histogram = MACD - Signal
-- MACD above Signal = BULLISH direction
-- MACD below Signal = BEARISH direction
-- Histogram sign flip = PRIMARY ENTRY TRIGGER
-- MACD > 0 = bullish territory, < 0 = bearish territory (affects confidence)
-- Divergence (price vs MACD histogram) = lowers confidence
+// ══════════════════════════════════════════════
+// INDICATOR CALCULATIONS
+// ══════════════════════════════════════════════
 
-### Bollinger Bands (20, 2) — PRIORITY 2: Volatility Filter (MANDATORY)
-- Middle Band = SMA(20) — dynamic trend filter
-- Upper Band = SMA(20) + 2×StdDev(20) — natural resistance
-- Lower Band = SMA(20) - 2×StdDev(20) — natural support
-- Price ABOVE BB Middle → only LONG allowed
-- Price BELOW BB Middle → only SHORT allowed
-- Band Width < 3% = squeeze (breakout imminent, raises confidence)
-- BB provides natural TP/SL zone references
-
-### VWAP — PRIORITY 3: Institutional Confirmation
-- VWAP = cumulative(typical_price × volume) / cumulative(volume)
-- Price above VWAP = confirms bullish (institutional buyers)
-- Price below VWAP = confirms bearish (institutional sellers)
-- VWAP confluence with BB middle = very strong S/R
-
-### ENTRY RULES (3 conditions must align)
-- MACD > Signal + price > BB Middle + price > VWAP → LONG
-- MACD < Signal + price < BB Middle + price < VWAP → SHORT
-- Any of the 3 disagree → HOLD
-That is the ONLY entry/hold decision. Nothing else blocks entry.
-
-### CONFIDENCE LEVEL (does NOT block entry, only adjusts confidence)
-HIGH confidence (all favorable):
-- MACD on correct side of zero (LONG: MACD>0, SHORT: MACD<0)
-- MACD histogram slope confirms direction
-- BB squeeze breakout or gap widening + no divergence + volume confirms
-
-MODERATE confidence (mixed signals):
-- MACD on wrong side of zero but crossover confirmed
-- BB bands stable, no squeeze
-
-LOW confidence (caution):
-- Histogram slope contradicts direction
-- Gap narrowing or divergence detected
-- Volume declining or price near BB opposite band
-
-### TP/SL PLACEMENT
-- SL at BB band levels or recent swing structure (1-2 ATR from entry)
-- TP at opposite BB band or structural target (≥2 ATR)
-- LONG: SL near lower BB / swing low, TP near upper BB
-- SHORT: SL near upper BB / swing high, TP near lower BB
-
-### Volume — CONFIRMATION
-- Rising with trend = continuation. Declining = exhaustion.
-
-## RULES
-1. R:R minimum 1:2 (prefer 1:3+). Below 1:2 → HOLD.
-2. SL at structural level 1-2 ATR. TP1 ≥2 ATR, TP2 ≥3-4 ATR.
-3. Entry: MACD direction + BB filter + VWAP confirmation must align. Otherwise HOLD.
-4. Slope/gap/divergence adjust confidence only, never block entry.
-
-## OUTPUT RULES
-- Entry = current price. No entry zone. Above entry = 저항, below = 지지.
-- All user text in Korean. NEVER mention MACD/BB/Bollinger/VWAP/EMA/SMA/ATR.
-- Use: 추세, 변동성, 거래기준선, 수요존/공급존, 지지선/저항선
-- Summary: MACD→"trend", BB→"volatility", VWAP→"fairValue", Overall→"confluence"`;
-
-const SIMPLE_PROMPT_SUFFIX = `
-
-## SIMPLE MODE — JSON only, no markdown:
-{"mode":"simple","direction":"LONG"/"SHORT"/"HOLD","confidence":"HIGH"/"MODERATE"/"LOW",
-"slZone":{"low":N,"high":N},"tpZone":{"low":N,"high":N},"riskReward":"1:X",
-"idealScenario":"<Korean>","comment":"<Korean, <80 chars, no indicator names>",
-"summary":{"trend":{"signal":"BULLISH"/"BEARISH"/"NEUTRAL","detail":"<Korean>"},
-"volatility":{"signal":"...","detail":"..."},"fairValue":{"signal":"...","detail":"..."},
-"confluence":{"signal":"...","detail":"..."}}}
-
-SL at BB/structural level (1-2 ATR). TP at structural level (≥2x SL). R:R<1:2→HOLD. Zones as low/high.`;
-
-const STRATEGIC_PROMPT_SUFFIX = `
-
-## COMPLEX MODE — JSON only, no markdown:
-{"mode":"strategic","direction":"LONG"/"SHORT"/"HOLD","confidence":"HIGH"/"MODERATE"/"LOW",
-"idealScenario":"<Korean>",
-"levels":{"tp1Zone":{"low":N,"high":N},"tp2Zone":{"low":N,"high":N},"sl1Zone":{"low":N,"high":N},"sl2Zone":{"low":N,"high":N}},
-"scenarios":{
-  "profitPath":{"name":"익절 경로","probability":"X%",
-    "trigger":{"label":"1차 익절","price":N,"pct":"(50%)"},
-    "outcomes":[
-      {"name":"1차 손절","probability":"X%","type":"sl","step":{"label":"1차 손절","price":N,"pct":"(50%)"},"description":"<Korean>"},
-      {"name":"2차 익절","probability":"X%","type":"tp","step":{"label":"2차 익절","price":N,"pct":"(50%)"},"description":"<Korean>"}]},
-  "lossPath":{"name":"손절 경로","probability":"X%",
-    "trigger":{"label":"1차 손절","price":N,"pct":"(50%)"},
-    "outcomes":[
-      {"name":"2차 익절 회복","probability":"X%","type":"tp","step":{"label":"2차 익절","price":N,"pct":"(50%)"},"description":"<Korean>"},
-      {"name":"2차 손절","probability":"X%","type":"sl","step":{"label":"2차 손절","price":N,"pct":"(50%)"},"description":"<Korean>"}]}},
-"exitStrategy":{"partialExit":"<Korean>","fullExit":"<Korean>","trailingStop":"<Korean>"},
-"comment":"<Korean, <120 chars>",
-"summary":{"trend":{...},"volatility":{...},"fairValue":{...},"confluence":{...}}}
-
-TREE: PATH1: Entry→TP1(50%)→SL1 or TP2. PATH2: Entry→SL1(50%)→TP2 or SL2.
-Probs: paths sum 100%, all 4 outcomes sum≈100%.
-SL1≈1-1.5ATR, SL2≈2-3ATR, TP1≥2ATR, TP2≥3-4ATR. BB-guided placement. No SL→HOLD. HOLD→null.
-LONG: tp1<tp2 above, sl1>sl2 below. SHORT: opposite. Labels: above=저항, below=지지.`;
-
-// ── Calculations ──
+function calcEMA(vals, len) {
+  const r = [], k = 2 / (len + 1);
+  let prev = null, seedCount = 0, seedSum = 0, seeded = false;
+  for (let i = 0; i < vals.length; i++) {
+    const v = vals[i];
+    if (v === null || v === undefined) { r.push(null); continue; }
+    if (!seeded) {
+      seedSum += v; seedCount++;
+      if (seedCount < len) { r.push(null); continue; }
+      prev = seedSum / len; r.push(prev); seeded = true; continue;
+    }
+    prev = v * k + prev * (1 - k);
+    r.push(prev);
+  }
+  return r;
+}
 
 function calcSMA(vals, len) {
   return vals.map((_, i) => {
@@ -129,23 +52,11 @@ function calcSMA(vals, len) {
   });
 }
 
-function calcEMA(vals, len) {
-  const r = [], k = 2 / (len + 1);
-  let prev = null;
-  for (const v of vals) {
-    if (v === null) { r.push(null); continue; }
-    if (prev === null) { prev = v; r.push(v); continue; }
-    prev = v * k + prev * (1 - k);
-    r.push(prev);
-  }
-  return r;
-}
-
-function calcMACD(closes) {
-  const ema12 = calcEMA(closes, 12);
-  const ema26 = calcEMA(closes, 26);
-  const macd = ema12.map((v, i) => (v !== null && ema26[i] !== null) ? v - ema26[i] : null);
-  const signal = calcEMA(macd, 9);
+function calcMACD(closes, fast = 12, slow = 26, sig = 9) {
+  const emaFast = calcEMA(closes, fast);
+  const emaSlow = calcEMA(closes, slow);
+  const macd = emaFast.map((v, i) => (v !== null && emaSlow[i] !== null) ? v - emaSlow[i] : null);
+  const signal = calcEMA(macd, sig);
   const histogram = macd.map((v, i) => (v !== null && signal[i] !== null) ? v - signal[i] : null);
   return { macd, signal, histogram };
 }
@@ -177,6 +88,23 @@ function calcVWAP(candles) {
   return vwap;
 }
 
+function calcVWAPAdaptive(candles, mode = 'cumulative') {
+  if (mode === 'cumulative') return calcVWAP(candles);
+  const window = mode === 'session' ? 6 : 50;
+  const vwap = [];
+  for (let i = 0; i < candles.length; i++) {
+    const start = Math.max(0, i - window + 1);
+    let tpv = 0, vol = 0;
+    for (let j = start; j <= i; j++) {
+      const tp = (candles[j].high + candles[j].low + candles[j].close) / 3;
+      tpv += tp * (candles[j].volume || 0);
+      vol += (candles[j].volume || 0);
+    }
+    vwap.push(vol > 0 ? tpv / vol : null);
+  }
+  return vwap;
+}
+
 function calcATR(candles, period = 14) {
   if (candles.length < period + 1) return [];
   const trs = [null];
@@ -193,6 +121,10 @@ function calcATR(candles, period = 14) {
   }
   return atr;
 }
+
+// ══════════════════════════════════════════════
+// TREND HEALTH (slope, gap, divergence)
+// ══════════════════════════════════════════════
 
 function calcSlope(values, lookback = 5) {
   const recent = values.slice(-lookback).filter(v => v !== null);
@@ -241,7 +173,101 @@ function detectDivergence(closes, indicator, lookback = 30) {
   return { bearish, bullish };
 }
 
-// ── Handler ──
+// ══════════════════════════════════════════════
+// DETERMINISTIC DIRECTION (2/3 majority vote)
+// ══════════════════════════════════════════════
+
+function determineDirection(macdVal, macdSig, currentPrice, bbMid, vwapVal, health) {
+  if (macdVal === null || macdSig === null || bbMid === null) {
+    return { direction: 'HOLD', votes: {}, confidence: 'LOW' };
+  }
+
+  const macdVote = macdVal > macdSig ? 'LONG' : 'SHORT';
+  const bbVote = currentPrice > bbMid ? 'LONG' : 'SHORT';
+  const vwapVote = vwapVal !== null ? (currentPrice > vwapVal ? 'LONG' : 'SHORT') : null;
+  const votes = { macd: macdVote, bb: bbVote, vwap: vwapVote || 'N/A' };
+
+  let longCount = 0, shortCount = 0;
+  [macdVote, bbVote, vwapVote].forEach(v => {
+    if (v === 'LONG') longCount++; else if (v === 'SHORT') shortCount++;
+  });
+
+  let direction, confidence;
+  if (longCount >= 2) { direction = 'LONG'; confidence = longCount === 3 ? 'HIGH' : 'MODERATE'; }
+  else if (shortCount >= 2) { direction = 'SHORT'; confidence = shortCount === 3 ? 'HIGH' : 'MODERATE'; }
+  else { direction = 'HOLD'; confidence = 'LOW'; }
+
+  // Confidence modifiers
+  if (direction !== 'HOLD' && health) {
+    if (direction === 'LONG' && health.macdDiv?.bearish) confidence = 'LOW';
+    if (direction === 'SHORT' && health.macdDiv?.bullish) confidence = 'LOW';
+    if (direction === 'LONG' && health.macdSlope !== null && health.macdSlope < -0.001 && confidence === 'HIGH') confidence = 'MODERATE';
+    if (direction === 'SHORT' && health.macdSlope !== null && health.macdSlope > 0.001 && confidence === 'HIGH') confidence = 'MODERATE';
+    if (health.macdGap?.direction === 'narrowing' && confidence === 'HIGH') confidence = 'MODERATE';
+  }
+
+  return { direction, votes, confidence, longCount, shortCount };
+}
+
+// ══════════════════════════════════════════════
+// DETERMINISTIC TP/SL (ATR + BB reference)
+// ══════════════════════════════════════════════
+
+function calculateLevels(direction, currentPrice, atr, bbUp, bbLow, bbMid, isStrategic) {
+  if (direction === 'HOLD' || !atr) return null;
+  const zw = currentPrice * 0.005;
+  const zone = (p) => ({ low: +(p - zw / 2).toFixed(6), high: +(p + zw / 2).toFixed(6) });
+
+  if (!isStrategic) {
+    let tp, sl;
+    if (direction === 'LONG') {
+      tp = bbUp ? Math.max(currentPrice + atr * 2, bbUp) : currentPrice + atr * 2;
+      sl = bbLow ? Math.max(currentPrice - atr * 2, bbLow) : currentPrice - atr * 2;
+      sl = Math.min(sl, currentPrice * 0.995);
+    } else {
+      tp = bbLow ? Math.min(currentPrice - atr * 2, bbLow) : currentPrice - atr * 2;
+      sl = bbUp ? Math.min(currentPrice + atr * 2, bbUp) : currentPrice + atr * 2;
+      sl = Math.max(sl, currentPrice * 1.005);
+    }
+    const reward = Math.abs(tp - currentPrice), risk = Math.abs(sl - currentPrice);
+    return { mode: 'simple', tpZone: zone(tp), slZone: zone(sl), riskReward: `1:${risk > 0 ? (reward / risk).toFixed(1) : '0'}` };
+  }
+
+  let tp1, tp2, sl1, sl2;
+  if (direction === 'LONG') {
+    tp1 = currentPrice + atr * 2.0;
+    tp2 = currentPrice + atr * 3.5;
+    sl1 = currentPrice - atr * 1.5;
+    sl2 = currentPrice - atr * 2.5;
+    if (bbUp) { tp1 = Math.max(tp1, (currentPrice + bbUp) / 2); tp2 = Math.max(tp2, bbUp); }
+    if (bbLow) sl2 = Math.min(sl2, bbLow);
+  } else {
+    tp1 = currentPrice - atr * 2.0;
+    tp2 = currentPrice - atr * 3.5;
+    sl1 = currentPrice + atr * 1.5;
+    sl2 = currentPrice + atr * 2.5;
+    if (bbLow) { tp1 = Math.min(tp1, (currentPrice + bbLow) / 2); tp2 = Math.min(tp2, bbLow); }
+    if (bbUp) sl2 = Math.max(sl2, bbUp);
+  }
+
+  return { mode: 'strategic', tp1Zone: zone(tp1), tp2Zone: zone(tp2), sl1Zone: zone(sl1), sl2Zone: zone(sl2), tp1, tp2, sl1, sl2 };
+}
+
+// ══════════════════════════════════════════════
+// AI COMMENTARY (minimal — no price generation)
+// ══════════════════════════════════════════════
+
+const COMMENTARY_SYSTEM = `You are a Korean chart commentator. You receive pre-calculated indicators and a deterministic signal. Provide brief Korean commentary ONLY.
+RULES:
+- All Korean. NEVER mention MACD, Bollinger, VWAP, BB, EMA, SMA, ATR.
+- Use: 추세, 변동성, 거래기준선, 모멘텀, 지지선/저항선
+- Do NOT provide prices or override direction. Keep concise.
+Respond in valid JSON only:
+{"comment":"<Korean, <80 chars>","idealScenario":"<Korean, 1-2 sentences>","summary":{"trend":{"signal":"BULLISH"/"BEARISH"/"NEUTRAL","detail":"<Korean>"},"volatility":{"signal":"...","detail":"..."},"fairValue":{"signal":"...","detail":"..."},"confluence":{"signal":"...","detail":"..."}}}`;
+
+// ══════════════════════════════════════════════
+// HANDLER
+// ══════════════════════════════════════════════
 
 exports.handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers, body: '' };
@@ -256,135 +282,115 @@ exports.handler = async (event) => {
     const isStrategic = mode === 'strategic';
 
     if (!candles || candles.length < 30) {
-      return { statusCode: 200, headers, body: JSON.stringify({ error: `캔들 부족: ${candles ? candles.length : 0}개 수신 (최소 30개 필요). bodySize=${rawBody.length}` }) };
+      return { statusCode: 200, headers, body: JSON.stringify({ error: `캔들 부족: ${candles ? candles.length : 0}개 (최소 30개)` }) };
     }
 
     const closes = candles.map(c => c.close);
     const volumes = candles.map(c => c.volume);
     const last = closes.length - 1;
     const currentPrice = closes[last];
+    const P = TF_PARAMS[timeframe] || TF_PARAMS['1d'];
 
-    // Indicators
-    const macdData = calcMACD(closes);
-    const bbData = calcBB(closes, 20, 2);
-    const vwapData = calcVWAP(candles);
-    const atrValues = calcATR(candles, 14);
+    // ── Indicators ──
+    const macdData = calcMACD(closes, P.macdFast, P.macdSlow, P.macdSig);
+    const bbData = calcBB(closes, P.bbLen, P.bbMult);
+    const vwapData = calcVWAPAdaptive(candles, P.vwapMode);
+    const atrValues = calcATR(candles, P.atrLen);
 
-    const currentATR = atrValues[last];
-    const atrPct = currentATR ? (currentATR / currentPrice * 100).toFixed(2) : null;
-
-    const macdVal = macdData.macd[last];
-    const macdSig = macdData.signal[last];
-    const macdHist = macdData.histogram[last];
+    const macdVal = macdData.macd[last], macdSig = macdData.signal[last], macdHist = macdData.histogram[last];
     const prevHist = macdData.histogram[last - 1];
-    const bbMid = bbData.middle[last];
-    const bbUp = bbData.upper[last];
-    const bbLow = bbData.lower[last];
-    const bbW = bbData.width[last];
-    const vwapVal = vwapData[last];
+    const bbMid = bbData.middle[last], bbUp = bbData.upper[last], bbLow = bbData.lower[last], bbW = bbData.width[last];
+    const vwapVal = vwapData[last], atrVal = atrValues[last];
 
-    // BB filter
-    const bbFilter = bbMid
-      ? (currentPrice > bbMid ? 'ABOVE BB Middle → LONG only' : 'BELOW BB Middle → SHORT only')
-      : 'N/A';
-    const bbMidPct = bbMid ? ((currentPrice - bbMid) / bbMid * 100).toFixed(2) : null;
-    const bbPosition = (bbUp && bbLow) ? ((currentPrice - bbLow) / (bbUp - bbLow) * 100).toFixed(1) : null;
+    // ── Health ──
+    const macdSlope = calcSlope(macdData.histogram, P.slopeLook);
+    const macdGap = calcGapTrend(macdData.macd, macdData.signal, P.slopeLook);
+    const macdDiv = detectDivergence(closes, macdData.histogram, P.divLook);
+    const bbSqueeze = bbW !== null && bbW < P.squeezePct;
+    const health = { macdSlope, macdGap, macdDiv, bbSqueeze };
 
-    // VWAP
-    const vwapPct = vwapVal ? ((currentPrice - vwapVal) / vwapVal * 100).toFixed(2) : null;
+    // ── Direction (deterministic) ──
+    const decision = determineDirection(macdVal, macdSig, currentPrice, bbMid, vwapVal, health);
 
-    // Health metrics
-    const macdSlope = calcSlope(macdData.histogram, 5);
-    const bbMidSlope = calcSlope(bbData.middle, 5);
-    const macdGap = calcGapTrend(macdData.macd, macdData.signal, 5);
-    const macdDiv = detectDivergence(closes, macdData.histogram, 30);
+    // ── TP/SL (deterministic) ──
+    const levels = calculateLevels(decision.direction, currentPrice, atrVal, bbUp, bbLow, bbMid, isStrategic);
 
-    const sl = (s) => s === null ? 'N/A' : s > 0.001 ? 'rising' : s < -0.001 ? 'falling' : 'flat';
-
-    const recentCandles = candles.slice(-50).map((c, i) => ({
-      idx: candles.length - 50 + i, t: c.time,
-      o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume
-    }));
-
+    // ── Volume ──
     const avgVol = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
     const recVol = volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
+    const volTrend = recVol > avgVol * 1.2 ? 'UP' : recVol < avgVol * 0.8 ? 'DOWN' : 'STABLE';
 
-    const prompt = `Analyze ${symbol} ${timeframe}. Mode: ${isStrategic ? 'COMPLEX' : 'SIMPLE'}.
-
-PRICE: ${currentPrice}
-ATR(14): ${currentATR?.toFixed(2) || 'N/A'} (${atrPct || 'N/A'}%)
-
-BB FILTER (MANDATORY):
-- BB Middle: ${bbMid?.toFixed(2) || 'N/A'}
-- BB Upper: ${bbUp?.toFixed(2) || 'N/A'}
-- BB Lower: ${bbLow?.toFixed(2) || 'N/A'}
-- BB Width: ${bbW?.toFixed(2) || 'N/A'}% ${bbW && bbW < 3 ? '⚠ SQUEEZE — breakout imminent' : ''}
-- ${bbFilter} (${bbMidPct ? bbMidPct + '% from BB Mid' : 'N/A'})
-- Band Position: ${bbPosition || 'N/A'}% (0=lower, 100=upper)
-- ABOVE BB Mid = only LONG. BELOW BB Mid = only SHORT. Violation = HOLD.
-
-MACD(12,26,9): ${macdVal?.toFixed(4) || 'N/A'} | Signal: ${macdSig?.toFixed(4) || 'N/A'} | ${macdVal && macdSig ? (macdVal > macdSig ? 'ABOVE Signal' : 'BELOW Signal') : 'N/A'} | Zero: ${macdVal ? (macdVal > 0 ? 'ABOVE(bull)' : 'BELOW(bear)') : 'N/A'}
-Histogram: ${macdHist?.toFixed(4) || 'N/A'} | Prev: ${prevHist?.toFixed(4) || 'N/A'} | Flip: ${macdHist && prevHist ? (Math.sign(macdHist) !== Math.sign(prevHist) ? 'YES — ENTRY TRIGGER' : 'NO') : 'N/A'}
-MACD health: hist slope ${sl(macdSlope)}(${macdSlope?.toFixed(4)}), gap ${macdGap.direction}, div: ${macdDiv.bearish ? 'BEARISH' : macdDiv.bullish ? 'BULLISH' : 'none'}
-
-VWAP: ${vwapVal?.toFixed(2) || 'N/A'} | ${vwapVal ? (currentPrice > vwapVal ? 'ABOVE (Buyers)' : 'BELOW (Sellers)') : 'N/A'} | ${vwapPct ? vwapPct + '% from VWAP' : 'N/A'}
-
-Vol: avg20=${avgVol.toFixed(0)} rec5=${recVol.toFixed(0)} ${recVol > avgVol * 1.2 ? 'UP' : recVol < avgVol * 0.8 ? 'DOWN' : 'STABLE'}
-
-CANDLES(50):
-${JSON.stringify(recentCandles)}
-
-MACD Hist(10): ${macdData.histogram.slice(-10).map(v => v?.toFixed(4)).join(',')}
-BB Mid(5): ${bbData.middle.slice(-5).map(v => v?.toFixed(2)).join(',')}
-BB Up(5): ${bbData.upper.slice(-5).map(v => v?.toFixed(2)).join(',')}
-BB Low(5): ${bbData.lower.slice(-5).map(v => v?.toFixed(2)).join(',')}
-
-RULES: Entry=${currentPrice}. No indicator names in text. Above=저항,below=지지. R:R<1:2→HOLD. Entry: MACD+BB+VWAP 3가지 방향 일치→진입, 불일치→HOLD. Slope/gap/divergence는 신뢰도만 조절. SL at BB/structural levels.
-JSON only.`;
-
-    const systemPrompt = SYSTEM_BASE + (isStrategic ? STRATEGIC_PROMPT_SUFFIX : SIMPLE_PROMPT_SUFFIX);
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': CLAUDE_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 3000,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      return { statusCode: 200, headers, body: JSON.stringify({ error: `AI 분석 오류: ${response.status}`, detail: errText.substring(0, 300) }) };
-    }
-
-    const aiData = await response.json();
-    const textContent = aiData.content?.find(c => c.type === 'text')?.text || '';
-
-    let analysis;
+    // ── AI commentary ──
+    let ai = { comment: '', idealScenario: '', summary: null };
     try {
-      const cleaned = textContent.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-      analysis = JSON.parse(cleaned);
-    } catch {
-      return { statusCode: 200, headers, body: JSON.stringify({ error: 'AI 응답 파싱 실패', raw: textContent.substring(0, 500) }) };
-    }
+      const histFlip = macdHist && prevHist ? Math.sign(macdHist) !== Math.sign(prevHist) : false;
+      const slopeStr = (s) => s === null ? 'flat' : s > 0.001 ? 'rising' : s < -0.001 ? 'falling' : 'flat';
+      const bp = bbUp && bbLow ? ((currentPrice - bbLow) / (bbUp - bbLow) * 100).toFixed(0) : '?';
 
-    analysis.currentPrice = currentPrice;
-    analysis.calculatedIndicators = {
+      const prompt = `${symbol} ${timeframe}: ${decision.direction} (${decision.confidence})
+투표: 추세=${decision.votes.macd} 밴드=${decision.votes.bb} 기준=${decision.votes.vwap}
+가격: ${currentPrice} | 히스토그램: ${slopeStr(macdSlope)}, 전환:${histFlip?'Y':'N'} | 밴드폭:${bbW?.toFixed(1)}%${bbSqueeze?' 스퀴즈':''} 위치:${bp}% | 기준선:${vwapVal?(currentPrice>vwapVal?'위':'아래'):'?'} | 거래량:${volTrend} | 다이버전스:${macdDiv.bearish?'하락':macdDiv.bullish?'상승':'없음'}
+${decision.direction!=='HOLD'&&levels?`TP:${isStrategic?levels.tp1?.toFixed(2)+'/'+levels.tp2?.toFixed(2):((levels.tpZone.low+levels.tpZone.high)/2).toFixed(2)} SL:${isStrategic?levels.sl1?.toFixed(2)+'/'+levels.sl2?.toFixed(2):((levels.slZone.low+levels.slZone.high)/2).toFixed(2)}`:'HOLD'}
+한국어 코멘터리 JSON.`;
+
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 800, system: COMMENTARY_SYSTEM, messages: [{ role: 'user', content: prompt }] })
+      });
+      if (r.ok) {
+        const d = await r.json();
+        const t = d.content?.find(c => c.type === 'text')?.text || '';
+        ai = JSON.parse(t.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim());
+      }
+    } catch (e) { console.error('[analyze] AI error:', e.message); }
+
+    // ── Response ──
+    const indicators = {
       macd: macdVal, macdSignal: macdSig, macdHistogram: macdHist,
-      bbUpper: bbUp, bbMiddle: bbMid, bbLower: bbLow, bbWidth: bbW ? parseFloat(bbW.toFixed(2)) : null,
-      vwap: vwapVal, atr: currentATR, atrPct: atrPct ? parseFloat(atrPct) : null,
-      avgVolume: avgVol, recentVolume: recVol,
-      trendHealth: { macdSlope, bbMidSlope, macdGap, macdDiv }
+      bbUpper: bbUp, bbMiddle: bbMid, bbLower: bbLow, bbWidth: bbW,
+      vwap: vwapVal, atr: atrVal, avgVolume: avgVol, recentVolume: recVol,
+      votes: decision.votes, params: P, health
     };
 
-    return { statusCode: 200, headers, body: JSON.stringify(analysis) };
+    let result;
+    if (isStrategic && decision.direction !== 'HOLD' && levels) {
+      const dir = decision.direction;
+      const [t1, t2, s1, s2] = dir === 'LONG'
+        ? ['1차 저항', '2차 저항', '1차 지지', '2차 지지']
+        : ['1차 지지', '2차 지지', '1차 저항', '2차 저항'];
+
+      result = {
+        mode: 'strategic', direction: dir, confidence: decision.confidence, currentPrice,
+        idealScenario: ai.idealScenario || '',
+        levels: { tp1Zone: levels.tp1Zone, tp2Zone: levels.tp2Zone, sl1Zone: levels.sl1Zone, sl2Zone: levels.sl2Zone },
+        scenarios: {
+          profitPath: { name: '익절 경로', probability: decision.confidence === 'HIGH' ? '65%' : '55%',
+            trigger: { label: '1차 익절', price: levels.tp1, pct: '(50%)' },
+            outcomes: [
+              { name: '1차 손절', probability: decision.confidence === 'HIGH' ? '25%' : '25%', type: 'sl', step: { label: '1차 손절', price: levels.sl1, pct: '(50%)' }, description: `${t1} 도달 후 반전 시 ${s1}에서 잔여 청산` },
+              { name: '2차 익절', probability: decision.confidence === 'HIGH' ? '40%' : '30%', type: 'tp', step: { label: '2차 익절', price: levels.tp2, pct: '(50%)' }, description: `추세 지속 시 ${t2}까지 잔여 보유` }
+            ] },
+          lossPath: { name: '손절 경로', probability: decision.confidence === 'HIGH' ? '35%' : '45%',
+            trigger: { label: '1차 손절', price: levels.sl1, pct: '(50%)' },
+            outcomes: [
+              { name: '2차 익절 회복', probability: decision.confidence === 'HIGH' ? '20%' : '20%', type: 'tp', step: { label: '2차 익절', price: levels.tp2, pct: '(50%)' }, description: `${s1} 이탈 후 반등 시 ${t2}까지 회복` },
+              { name: '2차 손절', probability: decision.confidence === 'HIGH' ? '15%' : '25%', type: 'sl', step: { label: '2차 손절', price: levels.sl2, pct: '(50%)' }, description: `추세 이탈 지속 시 ${s2}에서 전량 청산` }
+            ] }
+        },
+        exitStrategy: { partialExit: `${t1} 도달 시 50% 청산`, fullExit: `${s2} 이탈 시 전량 청산`, trailingStop: `${t1} 도달 후 진입가를 트레일링 스탑으로 이동` },
+        comment: ai.comment || '', summary: ai.summary || null, calculatedIndicators: indicators
+      };
+    } else {
+      result = {
+        mode: 'simple', direction: decision.direction, confidence: decision.confidence, currentPrice,
+        tpZone: levels?.tpZone || null, slZone: levels?.slZone || null, riskReward: levels?.riskReward || '—',
+        idealScenario: ai.idealScenario || '', comment: ai.comment || '', summary: ai.summary || null,
+        calculatedIndicators: indicators
+      };
+    }
+
+    return { statusCode: 200, headers, body: JSON.stringify(result) };
   } catch (err) {
     return { statusCode: 500, headers, body: JSON.stringify({ error: '서버 오류: ' + err.message }) };
   }
