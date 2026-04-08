@@ -181,24 +181,26 @@ async function startBacktest(){
     setProgress(0,`${totalBars}봉 시뮬레이션`,`${symbol} ${tf}`);
 
     const trades=[];let idx=startIdx,holdStreak=0;
+    let dbgHold=0,dbgErr=0,dbgNoZone=0,dbgTotal=0;
 
     while(idx<allCandles.length-1&&!cancelled&&trades.length<MAX_TRADES){
       const pct=((idx-startIdx)/totalBars*100).toFixed(0);
       const dateStr=new Date(allCandles[idx].time*1000).toISOString().split('T')[0];
-      setProgress(pct,`분석 ${trades.length+1}/${MAX_TRADES}`,`${dateStr} | ${trades.length}건 완료`);
+      setProgress(pct,`분석 ${trades.length+1}/${MAX_TRADES}`,`${dateStr} | ${trades.length}건 완료 | HOLD:${dbgHold} 에러:${dbgErr} 존없음:${dbgNoZone}`);
 
       const wStart=Math.max(0,idx-499),wCandles=allCandles.slice(wStart,idx+1);
       let analysis;
       try{analysis=await callAnalyze(wCandles,symbol,tf,mode);}catch(e){setProgress(pct,'API 오류 — 5초 후 재시도',e.message);await sleep(5000);continue;}
-      if(!analysis||analysis.error){idx++;continue;}
+      dbgTotal++;
+      if(!analysis||analysis.error){dbgErr++;idx++;continue;}
 
-      if(analysis.direction==='HOLD'){holdStreak++;idx+=holdStreak>=5?3:1;if(holdStreak>=5)holdStreak=0;continue;}
+      if(analysis.direction==='HOLD'){dbgHold++;holdStreak++;idx+=holdStreak>=5?3:1;if(holdStreak>=5)holdStreak=0;continue;}
       holdStreak=0;
 
       const dir=analysis.direction,entryPrice=allCandles[idx].close,entryTime=allCandles[idx].time;
       let tpZone,slZone;
       if(analysis.mode==='strategic'&&analysis.levels){tpZone=analysis.levels.tp1Zone;slZone=analysis.levels.sl1Zone;}else{tpZone=analysis.tpZone;slZone=analysis.slZone;}
-      if(!tpZone||!slZone){idx++;continue;}
+      if(!tpZone||!slZone){dbgNoZone++;idx++;continue;}
 
       let exitIdx=null,exitPrice=null,exitType=null;
       for(let j=idx+1;j<allCandles.length;j++){
@@ -218,8 +220,8 @@ async function startBacktest(){
       idx=exitIdx+1;await sleep(1500);
     }
 
-    if(trades.length===0){setProgress(100,'완료 — 거래 없음','');finish();return;}
-    setProgress(100,`완료 — ${trades.length}건`,'벤치마크 로드 중...');
+    if(trades.length===0){setProgress(100,'완료 — 거래 없음',`총 ${dbgTotal}회 분석: HOLD ${dbgHold}건, 에러 ${dbgErr}건, 존없음 ${dbgNoZone}건`);finish();return;}
+    setProgress(100,`완료 — ${trades.length}건`,`분석 ${dbgTotal}회 (HOLD:${dbgHold} 에러:${dbgErr}) | 벤치마크 로드 중...`);
 
     let benchCandles=null;try{benchCandles=await fetchCandles(benchSym,'us_stock',tf);}catch{}
     let cum=0;trades.forEach(t=>{cum+=t.pnlPct;t._cum=+cum.toFixed(2);});
