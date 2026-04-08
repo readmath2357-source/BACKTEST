@@ -199,12 +199,24 @@ function determineDirection(macdVal, macdSig, currentPrice, bbMid, vwapVal, heal
 
   // Confidence modifiers
   if (direction !== 'HOLD' && health) {
-    if (direction === 'LONG' && health.macdDiv?.bearish) confidence = 'LOW';
-    if (direction === 'SHORT' && health.macdDiv?.bullish) confidence = 'LOW';
-    if (direction === 'LONG' && health.macdSlope !== null && health.macdSlope < -0.001 && confidence === 'HIGH') confidence = 'MODERATE';
-    if (direction === 'SHORT' && health.macdSlope !== null && health.macdSlope > 0.001 && confidence === 'HIGH') confidence = 'MODERATE';
+    // Divergence blocks opposite direction
+    if (direction === 'LONG' && health.macdDiv?.bearish) { direction = 'HOLD'; confidence = 'LOW'; }
+    if (direction === 'SHORT' && health.macdDiv?.bullish) { direction = 'HOLD'; confidence = 'LOW'; }
+
+    // BB squeeze = low-conviction environment → HOLD
+    if (health.bbSqueeze) { direction = 'HOLD'; confidence = 'LOW'; }
+
+    // Histogram must agree with direction
+    if (direction === 'LONG' && health.macdSlope !== null && health.macdSlope < -0.001) { direction = 'HOLD'; confidence = 'LOW'; }
+    if (direction === 'SHORT' && health.macdSlope !== null && health.macdSlope > 0.001) { direction = 'HOLD'; confidence = 'LOW'; }
+
+    // Narrowing MACD gap = weakening momentum
+    if (health.macdGap?.direction === 'narrowing' && confidence !== 'HIGH') { direction = 'HOLD'; confidence = 'LOW'; }
     if (health.macdGap?.direction === 'narrowing' && confidence === 'HIGH') confidence = 'MODERATE';
   }
+
+  // Final gate: only HIGH or MODERATE may enter
+  if (confidence === 'LOW') direction = 'HOLD';
 
   return { direction, votes, confidence, longCount, shortCount };
 }
@@ -221,12 +233,12 @@ function calculateLevels(direction, currentPrice, atr, bbUp, bbLow, bbMid, isStr
   if (!isStrategic) {
     let tp, sl;
     if (direction === 'LONG') {
-      tp = bbUp ? Math.max(currentPrice + atr * 2, bbUp) : currentPrice + atr * 2;
-      sl = bbLow ? Math.max(currentPrice - atr * 2, bbLow) : currentPrice - atr * 2;
+      tp = bbUp ? Math.max(currentPrice + atr * 2.5, bbUp) : currentPrice + atr * 2.5;
+      sl = bbLow ? Math.max(currentPrice - atr * 1.5, bbLow) : currentPrice - atr * 1.5;
       sl = Math.min(sl, currentPrice * 0.995);
     } else {
-      tp = bbLow ? Math.min(currentPrice - atr * 2, bbLow) : currentPrice - atr * 2;
-      sl = bbUp ? Math.min(currentPrice + atr * 2, bbUp) : currentPrice + atr * 2;
+      tp = bbLow ? Math.min(currentPrice - atr * 2.5, bbLow) : currentPrice - atr * 2.5;
+      sl = bbUp ? Math.min(currentPrice + atr * 1.5, bbUp) : currentPrice + atr * 1.5;
       sl = Math.max(sl, currentPrice * 1.005);
     }
     const reward = Math.abs(tp - currentPrice), risk = Math.abs(sl - currentPrice);
@@ -235,15 +247,15 @@ function calculateLevels(direction, currentPrice, atr, bbUp, bbLow, bbMid, isStr
 
   let tp1, tp2, sl1, sl2;
   if (direction === 'LONG') {
-    tp1 = currentPrice + atr * 2.0;
-    tp2 = currentPrice + atr * 3.5;
+    tp1 = currentPrice + atr * 2.5;
+    tp2 = currentPrice + atr * 4.0;
     sl1 = currentPrice - atr * 1.5;
     sl2 = currentPrice - atr * 2.5;
     if (bbUp) { tp1 = Math.max(tp1, (currentPrice + bbUp) / 2); tp2 = Math.max(tp2, bbUp); }
     if (bbLow) sl2 = Math.min(sl2, bbLow);
   } else {
-    tp1 = currentPrice - atr * 2.0;
-    tp2 = currentPrice - atr * 3.5;
+    tp1 = currentPrice - atr * 2.5;
+    tp2 = currentPrice - atr * 4.0;
     sl1 = currentPrice + atr * 1.5;
     sl2 = currentPrice + atr * 2.5;
     if (bbLow) { tp1 = Math.min(tp1, (currentPrice + bbLow) / 2); tp2 = Math.min(tp2, bbLow); }
