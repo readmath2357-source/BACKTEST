@@ -104,7 +104,7 @@ tr:hover td{background:rgba(245,158,11,.03)}
 <body>
 <div class="topbar">
   <div class="topbar-logo">RFF Backtest <span>자동 순차 시뮬레이션</span></div>
-  <div class="topbar-right"><span class="topbar-badge">MACD · BB · VWAP</span><span class="topbar-limit">최대 10회</span></div>
+  <div class="topbar-right"><span class="topbar-badge">MACD · BB · VWAP</span></div>
 </div>
 <div class="config">
   <div class="config-row">
@@ -119,6 +119,7 @@ tr:hover td{background:rgba(245,158,11,.03)}
     <div class="cfg cfg-small"><label>초기 자본 (만원)</label><input type="number" id="initCapital" value="1000"></div>
     <div class="cfg cfg-small"><label>수수료 (%)</label><input type="number" id="commission" value="0.1" step="0.01"></div>
     <div class="cfg cfg-small"><label>슬리피지 (%)</label><input type="number" id="slippage" value="0.05" step="0.01"></div>
+    <div class="cfg cfg-small"><label>최대 거래 수</label><input type="number" id="maxTrades" value="10" min="1" max="999"></div>
     <div class="cfg"><label>벤치마크</label><select id="benchmark"><option value="SPY">S&P 500 (SPY)</option><option value="^KS11">KOSPI</option><option value="QQQ">NASDAQ (QQQ)</option><option value="BTC-USD">비트코인</option></select></div>
   </div>
 </div>
@@ -136,7 +137,6 @@ tr:hover td{background:rgba(245,158,11,.03)}
 
 <script>
 const API='/.netlify/functions';
-const MAX_TRADES=10;
 let running=false,cancelled=false,currentMarket='us_stock',searchTimeout=null,eqChart=null,ddChart=null;
 
 (function(){const d=new Date();d.setMonth(d.getMonth()-6);document.getElementById('startDate').value=d.toISOString().split('T')[0];})();
@@ -166,6 +166,7 @@ async function startBacktest(){
   const initCap=parseFloat(document.getElementById('initCapital').value)||1000;
   const commPct=parseFloat(document.getElementById('commission').value)||0,slipPct=parseFloat(document.getElementById('slippage').value)||0;
   const costPct=(commPct+slipPct)*2,benchSym=document.getElementById('benchmark').value;
+  const MAX_TRADES=parseInt(document.getElementById('maxTrades').value)||10;
   if(!symbol)return alert('종목을 입력하세요');if(!startDate)return alert('시작일을 선택하세요');
 
   running=true;cancelled=false;document.getElementById('btnRun').disabled=true;document.getElementById('btnStop').style.display='inline-block';
@@ -225,7 +226,7 @@ async function startBacktest(){
 
     let benchCandles=null;try{benchCandles=await fetchCandles(benchSym,'us_stock',tf);}catch{}
     let cum=0;trades.forEach(t=>{cum+=t.pnlPct;t._cum=+cum.toFixed(2);});
-    displayAll(trades,allCandles,startIdx,benchCandles,benchSym,{symbol,tf,startDate,mode,initCap,commPct,slipPct,costPct});
+    displayAll(trades,allCandles,startIdx,benchCandles,benchSym,{symbol,tf,startDate,mode,initCap,commPct,slipPct,costPct,MAX_TRADES});
   }catch(err){setProgress(0,'오류',err.message);}
   finish();
 }
@@ -246,7 +247,7 @@ function showConditions(trades,cfg){
     <div class="cond-item"><strong>종목:</strong> ${cfg.symbol}</div>
     <div class="cond-item"><strong>타임프레임:</strong> ${cfg.tf}</div>
     <div class="cond-item"><strong>테스트 기간:</strong> ${trades[0].entryDate} ~ ${trades[trades.length-1].exitDate}</div>
-    <div class="cond-item"><strong>총 거래:</strong> ${trades.length}건 / ${MAX_TRADES}회 제한</div>
+    <div class="cond-item"><strong>총 거래:</strong> ${trades.length}건 / ${cfg.MAX_TRADES}회 제한</div>
     <div class="cond-item"><strong>초기 자본:</strong> ${cfg.initCap.toLocaleString()}만원</div>
     <div class="cond-item"><strong>수수료:</strong> ${cfg.commPct}% (편도)</div>
     <div class="cond-item"><strong>슬리피지:</strong> ${cfg.slipPct}% (편도)</div>
