@@ -221,12 +221,12 @@ function calculateLevels(direction, currentPrice, atr, bbUp, bbLow, bbMid, isStr
   if (!isStrategic) {
     let tp, sl;
     if (direction === 'LONG') {
-      tp = bbUp ? Math.max(currentPrice + atr * 2.5, bbUp) : currentPrice + atr * 2.5;
-      sl = bbLow ? Math.max(currentPrice - atr * 1.5, bbLow) : currentPrice - atr * 1.5;
+      tp = bbUp ? Math.max(currentPrice + atr * 3, bbUp) : currentPrice + atr * 3;
+      sl = bbLow ? Math.max(currentPrice - atr * 2, bbLow) : currentPrice - atr * 2;
       sl = Math.min(sl, currentPrice * 0.995);
     } else {
-      tp = bbLow ? Math.min(currentPrice - atr * 2.5, bbLow) : currentPrice - atr * 2.5;
-      sl = bbUp ? Math.min(currentPrice + atr * 1.5, bbUp) : currentPrice + atr * 1.5;
+      tp = bbLow ? Math.min(currentPrice - atr * 3, bbLow) : currentPrice - atr * 3;
+      sl = bbUp ? Math.min(currentPrice + atr * 2, bbUp) : currentPrice + atr * 2;
       sl = Math.max(sl, currentPrice * 1.005);
     }
     const reward = Math.abs(tp - currentPrice), risk = Math.abs(sl - currentPrice);
