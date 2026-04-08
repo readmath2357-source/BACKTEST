@@ -1,8 +1,8 @@
 // netlify/functions/analyze.js v7.0
-// Deterministic backtest engine: HMA(100) + TSI(21,21,21) → direction, ATR(21) → TP/SL
-// Entry: price > HMA100 + TSI bullish = LONG / price < HMA100 + TSI bearish = SHORT
-// Exit: ATR(21) × 2.5 TP, ATR(21) × 2.0 SL
-// AI (Claude) provides Korean commentary ONLY
+// TSI + Fisher Transform + ATR strategy
+// Entry LONG: both TSI signals > 0, OR opposite sides + Fisher < -1.5
+// Entry SHORT: both TSI signals < 0, OR opposite sides + Fisher > +1.5
+// Exit: ATR(21) TP×2.5 / SL×2
 
 const headers = {
   'Content-Type': 'application/json',
@@ -14,42 +14,6 @@ const headers = {
 // ══════════════════════════════════════════════
 // INDICATOR CALCULATIONS
 // ══════════════════════════════════════════════
-
-function calcWMA(vals, len) {
-  const r = [];
-  for (let i = 0; i < vals.length; i++) {
-    if (i < len - 1 || vals[i] === null) { r.push(null); continue; }
-    let num = 0, den = 0;
-    for (let j = 0; j < len; j++) {
-      const v = vals[i - len + 1 + j];
-      if (v === null) { r.push(null); num = -1; break; }
-      const w = j + 1;
-      num += v * w;
-      den += w;
-    }
-    if (num === -1) continue;
-    r.push(num / den);
-  }
-  return r;
-}
-
-function calcHMA(vals, len) {
-  // HMA = WMA(2*WMA(n/2) - WMA(n), sqrt(n))
-  const halfLen = Math.floor(len / 2);
-  const sqrtLen = Math.round(Math.sqrt(len));
-  const wmaHalf = calcWMA(vals, halfLen);
-  const wmaFull = calcWMA(vals, len);
-  // 2*WMA(n/2) - WMA(n)
-  const diff = [];
-  for (let i = 0; i < vals.length; i++) {
-    if (wmaHalf[i] !== null && wmaFull[i] !== null) {
-      diff.push(2 * wmaHalf[i] - wmaFull[i]);
-    } else {
-      diff.push(null);
-    }
-  }
-  return calcWMA(diff, sqrtLen);
-}
 
 function calcEMA(vals, len) {
   const r = [], k = 2 / (len + 1);
@@ -68,37 +32,64 @@ function calcEMA(vals, len) {
   return r;
 }
 
-function calcTSI(closes, longLen = 21, shortLen = 21, sigLen = 21) {
-  // TSI = 100 * EMA(EMA(momentum, longLen), shortLen) / EMA(EMA(|momentum|, longLen), shortLen)
-  // Signal = EMA(TSI, sigLen)
-  const mom = [null];
+// TSI = 100 * EMA(EMA(change, long), short) / EMA(EMA(abs(change), long), short)
+// Signal = EMA(TSI, sigLen)
+function calcTSI(closes, longLen, shortLen, sigLen) {
+  const pc = [null];
   for (let i = 1; i < closes.length; i++) {
-    if (closes[i] === null || closes[i - 1] === null) { mom.push(null); continue; }
-    mom.push(closes[i] - closes[i - 1]);
+    pc.push(closes[i] - closes[i - 1]);
   }
-  const absMom = mom.map(v => v !== null ? Math.abs(v) : null);
+  const absPC = pc.map(v => v === null ? null : Math.abs(v));
 
-  const emaLong = calcEMA(mom, longLen);
-  const doubleSmooth = calcEMA(emaLong, shortLen);
+  const smoothPC = calcEMA(calcEMA(pc, longLen), shortLen);
+  const smoothAbsPC = calcEMA(calcEMA(absPC, longLen), shortLen);
 
-  const emaLongAbs = calcEMA(absMom, longLen);
-  const doubleSmoothAbs = calcEMA(emaLongAbs, shortLen);
-
-  const tsi = [];
-  for (let i = 0; i < closes.length; i++) {
-    if (doubleSmooth[i] !== null && doubleSmoothAbs[i] !== null && doubleSmoothAbs[i] !== 0) {
-      tsi.push(100 * doubleSmooth[i] / doubleSmoothAbs[i]);
-    } else {
-      tsi.push(null);
-    }
-  }
+  const tsi = smoothPC.map((v, i) => {
+    if (v === null || smoothAbsPC[i] === null || smoothAbsPC[i] === 0) return null;
+    return 100 * (v / smoothAbsPC[i]);
+  });
 
   const signal = calcEMA(tsi, sigLen);
   return { tsi, signal };
 }
 
+// Fisher Transform (matches Pine v6 code exactly)
+function calcFisher(candles, len) {
+  const fish1 = new Array(candles.length).fill(null);
+  const fish2 = new Array(candles.length).fill(null);
+  const values = new Array(candles.length).fill(0);
+
+  for (let i = 0; i < candles.length; i++) {
+    const hl2 = (candles[i].high + candles[i].low) / 2;
+
+    // highest/lowest of hl2 over len
+    let high_ = -Infinity, low_ = Infinity;
+    const start = Math.max(0, i - len + 1);
+    for (let j = start; j <= i; j++) {
+      const h2 = (candles[j].high + candles[j].low) / 2;
+      if (h2 > high_) high_ = h2;
+      if (h2 < low_) low_ = h2;
+    }
+
+    const range = high_ - low_;
+    let rawVal = range > 0 ? 0.66 * ((hl2 - low_) / range - 0.5) + 0.67 * (i > 0 ? values[i - 1] : 0) : 0;
+
+    // clamp
+    if (rawVal > 0.999) rawVal = 0.999;
+    if (rawVal < -0.999) rawVal = -0.999;
+    values[i] = rawVal;
+
+    const f = 0.5 * Math.log((1 + rawVal) / (1 - rawVal)) + 0.5 * (i > 0 && fish1[i - 1] !== null ? fish1[i - 1] : 0);
+    fish1[i] = f;
+    fish2[i] = i > 0 ? fish1[i - 1] : null;
+  }
+
+  return { fish1, fish2 };
+}
+
+// ATR
 function calcATR(candles, period = 21) {
-  if (candles.length < period + 1) return [];
+  if (candles.length < period + 1) return new Array(candles.length).fill(null);
   const trs = [null];
   for (let i = 1; i < candles.length; i++) {
     const h = candles[i].high, l = candles[i].low, pc = candles[i - 1].close;
@@ -115,40 +106,41 @@ function calcATR(candles, period = 21) {
 }
 
 // ══════════════════════════════════════════════
-// DIRECTION: HMA(100) + TSI(21,21,21)
+// DIRECTION LOGIC
 // ══════════════════════════════════════════════
 
-function determineDirection(currentPrice, hmaVal, tsiVal, tsiSig) {
-  if (hmaVal === null || tsiVal === null || tsiSig === null) {
-    return { direction: 'HOLD', confidence: 'LOW', hmaVote: 'N/A', tsiVote: 'N/A' };
+function determineDirection(tsiSlow, tsiSlowSig, tsiFast, tsiFastSig, fisherVal) {
+  if (tsiSlowSig === null || tsiFastSig === null) {
+    return { direction: 'HOLD', confidence: 'LOW', reason: 'insufficient_data' };
   }
 
-  const aboveHMA = currentPrice > hmaVal;
-  const tsiBullish = tsiVal > tsiSig;
+  const slowAbove0 = tsiSlowSig > 0;
+  const fastAbove0 = tsiFastSig > 0;
+  const bothAbove = slowAbove0 && fastAbove0;
+  const bothBelow = !slowAbove0 && !fastAbove0;
+  const opposite = slowAbove0 !== fastAbove0;
 
-  let direction, confidence;
-
-  if (aboveHMA && tsiBullish) {
-    direction = 'LONG';
-    confidence = tsiVal > 0 ? 'HIGH' : 'MODERATE';
-  } else if (!aboveHMA && !tsiBullish) {
-    direction = 'SHORT';
-    confidence = tsiVal < 0 ? 'HIGH' : 'MODERATE';
-  } else {
-    direction = 'HOLD';
-    confidence = 'LOW';
+  // LONG conditions
+  if (bothAbove) {
+    return { direction: 'LONG', confidence: 'HIGH', reason: 'both_tsi_above_0' };
+  }
+  if (opposite && fisherVal !== null && fisherVal < -1.5) {
+    return { direction: 'LONG', confidence: 'MODERATE', reason: 'fisher_oversold' };
   }
 
-  return {
-    direction,
-    confidence,
-    hmaVote: aboveHMA ? 'LONG' : 'SHORT',
-    tsiVote: tsiBullish ? 'LONG' : 'SHORT'
-  };
+  // SHORT conditions
+  if (bothBelow) {
+    return { direction: 'SHORT', confidence: 'HIGH', reason: 'both_tsi_below_0' };
+  }
+  if (opposite && fisherVal !== null && fisherVal > 1.5) {
+    return { direction: 'SHORT', confidence: 'MODERATE', reason: 'fisher_overbought' };
+  }
+
+  return { direction: 'HOLD', confidence: 'LOW', reason: 'no_signal' };
 }
 
 // ══════════════════════════════════════════════
-// TP/SL: ATR(21) × 2.5 TP, × 2.0 SL
+// TP/SL (ATR-based)
 // ══════════════════════════════════════════════
 
 function calculateLevels(direction, currentPrice, atr) {
@@ -179,10 +171,10 @@ function calculateLevels(direction, currentPrice, atr) {
 
 const COMMENTARY_SYSTEM = `You are a Korean chart commentator. You receive pre-calculated indicators and a deterministic signal. Provide brief Korean commentary ONLY.
 RULES:
-- All Korean. Use: 추세, 모멘텀, 이동평균, 지지선/저항선
+- All Korean. Use: 추세강도, 모멘텀, 과매수/과매도, 피셔전환, 지지선/저항선
 - Do NOT provide prices or override direction. Keep concise.
 Respond in valid JSON only:
-{"comment":"<Korean, <80 chars>","idealScenario":"<Korean, 1-2 sentences>","summary":{"trend":{"signal":"BULLISH"/"BEARISH"/"NEUTRAL","detail":"<Korean>"},"momentum":{"signal":"...","detail":"..."},"confluence":{"signal":"...","detail":"..."}}}`;
+{"comment":"<Korean, <80 chars>","idealScenario":"<Korean, 1-2 sentences>","summary":{"trend":{"signal":"BULLISH"/"BEARISH"/"NEUTRAL","detail":"<Korean>"},"momentum":{"signal":"...","detail":"..."},"fisher":{"signal":"...","detail":"..."},"confluence":{"signal":"...","detail":"..."}}}`;
 
 // ══════════════════════════════════════════════
 // HANDLER
@@ -196,10 +188,10 @@ exports.handler = async (event) => {
 
   try {
     const body = JSON.parse(event.body || '{}');
-    const { candles, symbol, timeframe } = body;
+    const { candles, symbol, timeframe, mode } = body;
 
-    if (!candles || candles.length < 120) {
-      return { statusCode: 200, headers, body: JSON.stringify({ error: `캔들 부족: ${candles ? candles.length : 0}개 (최소 120개 필요 — HMA100)` }) };
+    if (!candles || candles.length < 50) {
+      return { statusCode: 200, headers, body: JSON.stringify({ error: `캔들 부족: ${candles ? candles.length : 0}개 (최소 50개)` }) };
     }
 
     const closes = candles.map(c => c.close);
@@ -207,17 +199,21 @@ exports.handler = async (event) => {
     const currentPrice = closes[last];
 
     // ── Indicators ──
-    const hmaData = calcHMA(closes, 100);
-    const tsiData = calcTSI(closes, 21, 21, 21);
+    const tsiSlow = calcTSI(closes, 21, 21, 21);
+    const tsiFast = calcTSI(closes, 13, 13, 13);
+    const fisher = calcFisher(candles, 9);
     const atrValues = calcATR(candles, 21);
 
-    const hmaVal = hmaData[last];
-    const tsiVal = tsiData.tsi[last];
-    const tsiSigVal = tsiData.signal[last];
+    const tsiSlowVal = tsiSlow.tsi[last];
+    const tsiSlowSig = tsiSlow.signal[last];
+    const tsiFastVal = tsiFast.tsi[last];
+    const tsiFastSig = tsiFast.signal[last];
+    const fisherVal = fisher.fish1[last];
+    const fisherTrigger = fisher.fish2[last];
     const atrVal = atrValues[last];
 
     // ── Direction ──
-    const decision = determineDirection(currentPrice, hmaVal, tsiVal, tsiSigVal);
+    const decision = determineDirection(tsiSlowVal, tsiSlowSig, tsiFastVal, tsiFastSig, fisherVal);
 
     // ── TP/SL ──
     const levels = calculateLevels(decision.direction, currentPrice, atrVal);
@@ -225,11 +221,10 @@ exports.handler = async (event) => {
     // ── AI commentary ──
     let ai = { comment: '', idealScenario: '', summary: null };
     try {
-      const prompt = `${symbol} ${timeframe}: ${decision.direction} (${decision.confidence})
-HMA100: ${hmaVal?.toFixed(2)} (가격 ${currentPrice > hmaVal ? '위' : '아래'})
-TSI(21,21,21): ${tsiVal?.toFixed(2)} / 시그널: ${tsiSigVal?.toFixed(2)} (${tsiVal > tsiSigVal ? '매수' : '매도'})
-ATR(21): ${atrVal?.toFixed(4)}
-${decision.direction !== 'HOLD' && levels ? `TP: ${((levels.tpZone.low + levels.tpZone.high) / 2).toFixed(2)} (ATR×2.5) SL: ${((levels.slZone.low + levels.slZone.high) / 2).toFixed(2)} (ATR×2.0)` : 'HOLD'}
+      const prompt = `${symbol} ${timeframe}: ${decision.direction} (${decision.confidence}, ${decision.reason})
+TSI(21,21,21): ${tsiSlowVal?.toFixed(2)} sig:${tsiSlowSig?.toFixed(2)} | TSI(13,13,13): ${tsiFastVal?.toFixed(2)} sig:${tsiFastSig?.toFixed(2)}
+Fisher(9): ${fisherVal?.toFixed(2)} trigger:${fisherTrigger?.toFixed(2)} | ATR(21): ${atrVal?.toFixed(4)}
+가격: ${currentPrice}${levels ? ` | TP:${((levels.tpZone.low + levels.tpZone.high) / 2).toFixed(2)} SL:${((levels.slZone.low + levels.slZone.high) / 2).toFixed(2)}` : ' | HOLD'}
 한국어 코멘터리 JSON.`;
 
       const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -245,10 +240,18 @@ ${decision.direction !== 'HOLD' && levels ? `TP: ${((levels.tpZone.low + levels.
     } catch (e) { console.error('[analyze] AI error:', e.message); }
 
     // ── Response ──
+    const indicators = {
+      tsiSlow: tsiSlowVal, tsiSlowSignal: tsiSlowSig,
+      tsiFast: tsiFastVal, tsiFastSignal: tsiFastSig,
+      fisher: fisherVal, fisherTrigger,
+      atr: atrVal
+    };
+
     const result = {
       mode: 'simple',
       direction: decision.direction,
       confidence: decision.confidence,
+      reason: decision.reason,
       currentPrice,
       tpZone: levels?.tpZone || null,
       slZone: levels?.slZone || null,
@@ -256,13 +259,7 @@ ${decision.direction !== 'HOLD' && levels ? `TP: ${((levels.tpZone.low + levels.
       idealScenario: ai.idealScenario || '',
       comment: ai.comment || '',
       summary: ai.summary || null,
-      calculatedIndicators: {
-        hma100: hmaVal,
-        tsi: tsiVal,
-        tsiSignal: tsiSigVal,
-        atr21: atrVal,
-        votes: { hma: decision.hmaVote, tsi: decision.tsiVote }
-      }
+      calculatedIndicators: indicators
     };
 
     return { statusCode: 200, headers, body: JSON.stringify(result) };
