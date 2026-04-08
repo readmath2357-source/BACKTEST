@@ -2,7 +2,7 @@
 // TSI + Fisher Transform + ATR strategy
 // Entry LONG: both TSI signals > 0, OR opposite sides + Fisher < -1.5
 // Entry SHORT: both TSI signals < 0, OR opposite sides + Fisher > +1.5
-// Exit: ATR(21) TP×2.5 / SL×2
+// Exit: ATR(21) TP×2 / SL×1.5
 
 const headers = {
   'Content-Type': 'application/json',
@@ -150,11 +150,11 @@ function calculateLevels(direction, currentPrice, atr) {
 
   let tp, sl;
   if (direction === 'LONG') {
-    tp = currentPrice + atr * 2.5;
-    sl = currentPrice - atr * 2.0;
+    tp = currentPrice + atr * 2.0;
+    sl = currentPrice - atr * 1.5;
   } else {
-    tp = currentPrice - atr * 2.5;
-    sl = currentPrice + atr * 2.0;
+    tp = currentPrice - atr * 2.0;
+    sl = currentPrice + atr * 1.5;
   }
 
   const reward = Math.abs(tp - currentPrice), risk = Math.abs(sl - currentPrice);
