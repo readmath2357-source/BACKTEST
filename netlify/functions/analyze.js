@@ -1,8 +1,8 @@
 // netlify/functions/analyze.js v7.0
-// TSI + Fisher Transform + ATR strategy
-// Entry LONG: both TSI signals > 0, OR opposite sides + Fisher < -1.5
-// Entry SHORT: both TSI signals < 0, OR opposite sides + Fisher > +1.5
-// Exit: ATR(21) TP×2 / SL×1.5
+// TSI(13,13,13) + TSI(8,8,8) + Fisher(8) + ATR strategy
+// Entry LONG: TSI13 sig < TSI8 sig, then (both>0 + fisher<0) or (any<0 → ignore fisher)
+// Entry SHORT: TSI13 sig > TSI8 sig, then (both<0 + fisher>0) or (any>0 → ignore fisher)
+// Exit: ATR(21) TP×2.5 / SL×2
 
 const headers = {
   'Content-Type': 'application/json',
@@ -109,31 +109,37 @@ function calcATR(candles, period = 21) {
 // DIRECTION LOGIC
 // ══════════════════════════════════════════════
 
-function determineDirection(tsiSlow, tsiSlowSig, tsiFast, tsiFastSig, fisherVal) {
+function determineDirection(tsiSlowSig, tsiFastSig, fisherVal) {
+  // tsiSlowSig = TSI(13,13,13) signal, tsiFastSig = TSI(8,8,8) signal
   if (tsiSlowSig === null || tsiFastSig === null) {
     return { direction: 'HOLD', confidence: 'LOW', reason: 'insufficient_data' };
   }
 
-  const slowAbove0 = tsiSlowSig > 0;
-  const fastAbove0 = tsiFastSig > 0;
-  const bothAbove = slowAbove0 && fastAbove0;
-  const bothBelow = !slowAbove0 && !fastAbove0;
-  const opposite = slowAbove0 !== fastAbove0;
+  const slowBelowFast = tsiSlowSig < tsiFastSig; // LONG candidate
+  const slowAboveFast = tsiSlowSig > tsiFastSig; // SHORT candidate
 
-  // LONG conditions
-  if (bothAbove) {
-    return { direction: 'LONG', confidence: 'HIGH', reason: 'both_tsi_above_0' };
-  }
-  if (opposite && fisherVal !== null && fisherVal < -1.5) {
-    return { direction: 'LONG', confidence: 'MODERATE', reason: 'fisher_oversold' };
+  // LONG: TSI13 sig < TSI8 sig
+  if (slowBelowFast) {
+    const bothAbove0 = tsiSlowSig > 0 && tsiFastSig > 0;
+    const anyBelow0 = tsiSlowSig < 0 || tsiFastSig < 0;
+    if (bothAbove0 && fisherVal !== null && fisherVal < 0) {
+      return { direction: 'LONG', confidence: 'HIGH', reason: 'both_above0_fisher_below0' };
+    }
+    if (anyBelow0) {
+      return { direction: 'LONG', confidence: 'MODERATE', reason: 'any_below0_fisher_ignored' };
+    }
   }
 
-  // SHORT conditions
-  if (bothBelow) {
-    return { direction: 'SHORT', confidence: 'HIGH', reason: 'both_tsi_below_0' };
-  }
-  if (opposite && fisherVal !== null && fisherVal > 1.5) {
-    return { direction: 'SHORT', confidence: 'MODERATE', reason: 'fisher_overbought' };
+  // SHORT: TSI13 sig > TSI8 sig
+  if (slowAboveFast) {
+    const bothBelow0 = tsiSlowSig < 0 && tsiFastSig < 0;
+    const anyAbove0 = tsiSlowSig > 0 || tsiFastSig > 0;
+    if (bothBelow0 && fisherVal !== null && fisherVal > 0) {
+      return { direction: 'SHORT', confidence: 'HIGH', reason: 'both_below0_fisher_above0' };
+    }
+    if (anyAbove0) {
+      return { direction: 'SHORT', confidence: 'MODERATE', reason: 'any_above0_fisher_ignored' };
+    }
   }
 
   return { direction: 'HOLD', confidence: 'LOW', reason: 'no_signal' };
@@ -150,11 +156,11 @@ function calculateLevels(direction, currentPrice, atr) {
 
   let tp, sl;
   if (direction === 'LONG') {
-    tp = currentPrice + atr * 2.0;
-    sl = currentPrice - atr * 1.5;
+    tp = currentPrice + atr * 2.5;
+    sl = currentPrice - atr * 2.0;
   } else {
-    tp = currentPrice - atr * 2.0;
-    sl = currentPrice + atr * 1.5;
+    tp = currentPrice - atr * 2.5;
+    sl = currentPrice + atr * 2.0;
   }
 
   const reward = Math.abs(tp - currentPrice), risk = Math.abs(sl - currentPrice);
@@ -199,9 +205,9 @@ exports.handler = async (event) => {
     const currentPrice = closes[last];
 
     // ── Indicators ──
-    const tsiSlow = calcTSI(closes, 21, 21, 21);
-    const tsiFast = calcTSI(closes, 13, 13, 13);
-    const fisher = calcFisher(candles, 9);
+    const tsiSlow = calcTSI(closes, 13, 13, 13);
+    const tsiFast = calcTSI(closes, 8, 8, 8);
+    const fisher = calcFisher(candles, 8);
     const atrValues = calcATR(candles, 21);
 
     const tsiSlowVal = tsiSlow.tsi[last];
@@ -213,7 +219,7 @@ exports.handler = async (event) => {
     const atrVal = atrValues[last];
 
     // ── Direction ──
-    const decision = determineDirection(tsiSlowVal, tsiSlowSig, tsiFastVal, tsiFastSig, fisherVal);
+    const decision = determineDirection(tsiSlowSig, tsiFastSig, fisherVal);
 
     // ── TP/SL ──
     const levels = calculateLevels(decision.direction, currentPrice, atrVal);
@@ -222,8 +228,8 @@ exports.handler = async (event) => {
     let ai = { comment: '', idealScenario: '', summary: null };
     try {
       const prompt = `${symbol} ${timeframe}: ${decision.direction} (${decision.confidence}, ${decision.reason})
-TSI(21,21,21): ${tsiSlowVal?.toFixed(2)} sig:${tsiSlowSig?.toFixed(2)} | TSI(13,13,13): ${tsiFastVal?.toFixed(2)} sig:${tsiFastSig?.toFixed(2)}
-Fisher(9): ${fisherVal?.toFixed(2)} trigger:${fisherTrigger?.toFixed(2)} | ATR(21): ${atrVal?.toFixed(4)}
+TSI(13,13,13): ${tsiSlowVal?.toFixed(2)} sig:${tsiSlowSig?.toFixed(2)} | TSI(8,8,8): ${tsiFastVal?.toFixed(2)} sig:${tsiFastSig?.toFixed(2)}
+Fisher(8): ${fisherVal?.toFixed(2)} trigger:${fisherTrigger?.toFixed(2)} | ATR(21): ${atrVal?.toFixed(4)}
 가격: ${currentPrice}${levels ? ` | TP:${((levels.tpZone.low + levels.tpZone.high) / 2).toFixed(2)} SL:${((levels.slZone.low + levels.slZone.high) / 2).toFixed(2)}` : ' | HOLD'}
 한국어 코멘터리 JSON.`;
 
