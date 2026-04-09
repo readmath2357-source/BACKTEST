@@ -2,7 +2,7 @@
 // TSI(13,13,13) + TSI(8,8,8) + Fisher(8) + ATR strategy
 // Entry LONG: TSI13 sig < TSI8 sig, then (both>0 + fisher<0) or (any<0 → ignore fisher)
 // Entry SHORT: TSI13 sig > TSI8 sig, then (both<0 + fisher>0) or (any>0 → ignore fisher)
-// Exit: ATR(21) TP×2.5 / SL×2
+// Exit: ATR(21) TP×2/SL×1.5 (LOW: TP×1.5/SL×1.5)
 
 const headers = {
   'Content-Type': 'application/json',
@@ -123,10 +123,10 @@ function determineDirection(tsiSlowSig, tsiFastSig, fisherVal) {
     const bothAbove0 = tsiSlowSig > 0 && tsiFastSig > 0;
     const anyBelow0 = tsiSlowSig < 0 || tsiFastSig < 0;
     if (bothAbove0 && fisherVal !== null && fisherVal < 0) {
-      return { direction: 'LONG', confidence: 'HIGH', reason: 'both_above0_fisher_below0', tpMult: 2.5, slMult: 2.0 };
+      return { direction: 'LONG', confidence: 'HIGH', reason: 'both_above0_fisher_below0', tpMult: 2.0, slMult: 1.5 };
     }
     if (anyBelow0) {
-      return { direction: 'LONG', confidence: 'MODERATE', reason: 'any_below0_fisher_ignored', tpMult: 2.5, slMult: 2.0 };
+      return { direction: 'LONG', confidence: 'MODERATE', reason: 'any_below0_fisher_ignored', tpMult: 2.0, slMult: 1.5 };
     }
     // Gap: both above 0 but fisher >= 0
     if (bothAbove0) {
@@ -139,10 +139,10 @@ function determineDirection(tsiSlowSig, tsiFastSig, fisherVal) {
     const bothBelow0 = tsiSlowSig < 0 && tsiFastSig < 0;
     const anyAbove0 = tsiSlowSig > 0 || tsiFastSig > 0;
     if (bothBelow0 && fisherVal !== null && fisherVal > 0) {
-      return { direction: 'SHORT', confidence: 'HIGH', reason: 'both_below0_fisher_above0', tpMult: 2.5, slMult: 2.0 };
+      return { direction: 'SHORT', confidence: 'HIGH', reason: 'both_below0_fisher_above0', tpMult: 2.0, slMult: 1.5 };
     }
     if (anyAbove0) {
-      return { direction: 'SHORT', confidence: 'MODERATE', reason: 'any_above0_fisher_ignored', tpMult: 2.5, slMult: 2.0 };
+      return { direction: 'SHORT', confidence: 'MODERATE', reason: 'any_above0_fisher_ignored', tpMult: 2.0, slMult: 1.5 };
     }
     // Gap: both below 0 but fisher <= 0
     if (bothBelow0) {
@@ -157,7 +157,7 @@ function determineDirection(tsiSlowSig, tsiFastSig, fisherVal) {
 // TP/SL (ATR-based)
 // ══════════════════════════════════════════════
 
-function calculateLevels(direction, currentPrice, atr, tpMult = 2.5, slMult = 2.0) {
+function calculateLevels(direction, currentPrice, atr, tpMult = 2.0, slMult = 1.5) {
   if (direction === 'HOLD' || !atr) return null;
   const zw = currentPrice * 0.005;
   const zone = (p) => ({ low: +(p - zw / 2).toFixed(6), high: +(p + zw / 2).toFixed(6) });
