@@ -251,8 +251,8 @@ function showConditions(trades,cfg){
     <div class="cond-item"><strong>수수료:</strong> ${cfg.commPct}% (편도)</div>
     <div class="cond-item"><strong>슬리피지:</strong> ${cfg.slipPct}% (편도)</div>
     <div class="cond-item"><strong>왕복 비용:</strong> ${cfg.costPct.toFixed(2)}%</div>
-    <div class="cond-item"><strong>전략:</strong> RSI(8)+SMA(8)+Fisher(8) / ATR(21)</div>
-    <div class="cond-item"><strong>진입:</strong> RSI SMA 50 기준 + Fisher 방향 확인 시 종가 진입</div>
+    <div class="cond-item"><strong>전략:</strong> RSI(21)+SMA(21)+Fisher(8) / ATR(21)</div>
+    <div class="cond-item"><strong>진입:</strong> RSI SMA 55 기준 + Fisher 방향/크로스 확인</div>
     <div class="cond-item"><strong>청산:</strong> ATR(21) TP×2 / SL×1</div>
   </div>`;
 }
