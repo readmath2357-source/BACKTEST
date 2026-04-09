@@ -123,10 +123,14 @@ function determineDirection(tsiSlowSig, tsiFastSig, fisherVal) {
     const bothAbove0 = tsiSlowSig > 0 && tsiFastSig > 0;
     const anyBelow0 = tsiSlowSig < 0 || tsiFastSig < 0;
     if (bothAbove0 && fisherVal !== null && fisherVal < 0) {
-      return { direction: 'LONG', confidence: 'HIGH', reason: 'both_above0_fisher_below0' };
+      return { direction: 'LONG', confidence: 'HIGH', reason: 'both_above0_fisher_below0', tpMult: 2.5, slMult: 2.0 };
     }
     if (anyBelow0) {
-      return { direction: 'LONG', confidence: 'MODERATE', reason: 'any_below0_fisher_ignored' };
+      return { direction: 'LONG', confidence: 'MODERATE', reason: 'any_below0_fisher_ignored', tpMult: 2.5, slMult: 2.0 };
+    }
+    // Gap: both above 0 but fisher >= 0
+    if (bothAbove0) {
+      return { direction: 'LONG', confidence: 'LOW', reason: 'both_above0_fisher_same', tpMult: 1.5, slMult: 1.5 };
     }
   }
 
@@ -135,10 +139,14 @@ function determineDirection(tsiSlowSig, tsiFastSig, fisherVal) {
     const bothBelow0 = tsiSlowSig < 0 && tsiFastSig < 0;
     const anyAbove0 = tsiSlowSig > 0 || tsiFastSig > 0;
     if (bothBelow0 && fisherVal !== null && fisherVal > 0) {
-      return { direction: 'SHORT', confidence: 'HIGH', reason: 'both_below0_fisher_above0' };
+      return { direction: 'SHORT', confidence: 'HIGH', reason: 'both_below0_fisher_above0', tpMult: 2.5, slMult: 2.0 };
     }
     if (anyAbove0) {
-      return { direction: 'SHORT', confidence: 'MODERATE', reason: 'any_above0_fisher_ignored' };
+      return { direction: 'SHORT', confidence: 'MODERATE', reason: 'any_above0_fisher_ignored', tpMult: 2.5, slMult: 2.0 };
+    }
+    // Gap: both below 0 but fisher <= 0
+    if (bothBelow0) {
+      return { direction: 'SHORT', confidence: 'LOW', reason: 'both_below0_fisher_same', tpMult: 1.5, slMult: 1.5 };
     }
   }
 
@@ -149,18 +157,18 @@ function determineDirection(tsiSlowSig, tsiFastSig, fisherVal) {
 // TP/SL (ATR-based)
 // ══════════════════════════════════════════════
 
-function calculateLevels(direction, currentPrice, atr) {
+function calculateLevels(direction, currentPrice, atr, tpMult = 2.5, slMult = 2.0) {
   if (direction === 'HOLD' || !atr) return null;
   const zw = currentPrice * 0.005;
   const zone = (p) => ({ low: +(p - zw / 2).toFixed(6), high: +(p + zw / 2).toFixed(6) });
 
   let tp, sl;
   if (direction === 'LONG') {
-    tp = currentPrice + atr * 2.5;
-    sl = currentPrice - atr * 2.0;
+    tp = currentPrice + atr * tpMult;
+    sl = currentPrice - atr * slMult;
   } else {
-    tp = currentPrice - atr * 2.5;
-    sl = currentPrice + atr * 2.0;
+    tp = currentPrice - atr * tpMult;
+    sl = currentPrice + atr * slMult;
   }
 
   const reward = Math.abs(tp - currentPrice), risk = Math.abs(sl - currentPrice);
@@ -222,7 +230,7 @@ exports.handler = async (event) => {
     const decision = determineDirection(tsiSlowSig, tsiFastSig, fisherVal);
 
     // ── TP/SL ──
-    const levels = calculateLevels(decision.direction, currentPrice, atrVal);
+    const levels = calculateLevels(decision.direction, currentPrice, atrVal, decision.tpMult, decision.slMult);
 
     // ── AI commentary ──
     let ai = { comment: '', idealScenario: '', summary: null };
