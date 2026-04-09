@@ -1,8 +1,8 @@
-// netlify/functions/analyze.js v7.0
-// TSI(13,13,13) + TSI(8,8,8) + Fisher(8) + ATR strategy
-// Entry LONG: TSI13 sig < TSI8 sig, then (both>0 + fisher<0) or (any<0 → ignore fisher)
-// Entry SHORT: TSI13 sig > TSI8 sig, then (both<0 + fisher>0) or (any>0 → ignore fisher)
-// Exit: ATR(21) TP×2/SL×1.5 (LOW: TP×1.5/SL×1.5)
+// netlify/functions/analyze.js v8.0
+// RSI(8) + SMA(8) + Fisher(8) + ATR(21) strategy
+// LONG: RSI SMA > 50 + Fisher > -1.5 & Fisher > Trigger
+// SHORT: RSI SMA < 50 + Fisher < +1.5 & Fisher < Trigger
+// Exit: ATR(21) TP×2 / SL×1
 
 const headers = {
   'Content-Type': 'application/json',
@@ -15,45 +15,53 @@ const headers = {
 // INDICATOR CALCULATIONS
 // ══════════════════════════════════════════════
 
-function calcEMA(vals, len) {
-  const r = [], k = 2 / (len + 1);
-  let prev = null, seedCount = 0, seedSum = 0, seeded = false;
+function calcRMA(vals, len) {
+  const r = [];
+  let sum = 0, count = 0, prev = null;
   for (let i = 0; i < vals.length; i++) {
     const v = vals[i];
     if (v === null || v === undefined) { r.push(null); continue; }
-    if (!seeded) {
-      seedSum += v; seedCount++;
-      if (seedCount < len) { r.push(null); continue; }
-      prev = seedSum / len; r.push(prev); seeded = true; continue;
+    if (prev === null) {
+      sum += v; count++;
+      if (count < len) { r.push(null); continue; }
+      prev = sum / len; r.push(prev); continue;
     }
-    prev = v * k + prev * (1 - k);
+    prev = (prev * (len - 1) + v) / len;
     r.push(prev);
   }
   return r;
 }
 
-// TSI = 100 * EMA(EMA(change, long), short) / EMA(EMA(abs(change), long), short)
-// Signal = EMA(TSI, sigLen)
-function calcTSI(closes, longLen, shortLen, sigLen) {
-  const pc = [null];
-  for (let i = 1; i < closes.length; i++) {
-    pc.push(closes[i] - closes[i - 1]);
-  }
-  const absPC = pc.map(v => v === null ? null : Math.abs(v));
-
-  const smoothPC = calcEMA(calcEMA(pc, longLen), shortLen);
-  const smoothAbsPC = calcEMA(calcEMA(absPC, longLen), shortLen);
-
-  const tsi = smoothPC.map((v, i) => {
-    if (v === null || smoothAbsPC[i] === null || smoothAbsPC[i] === 0) return null;
-    return 100 * (v / smoothAbsPC[i]);
+function calcSMA(vals, len) {
+  return vals.map((_, i) => {
+    if (i < len - 1) return null;
+    let s = 0, c = 0;
+    for (let j = i - len + 1; j <= i; j++) {
+      if (vals[j] !== null && vals[j] !== undefined) { s += vals[j]; c++; }
+    }
+    return c > 0 ? s / c : null;
   });
-
-  const signal = calcEMA(tsi, sigLen);
-  return { tsi, signal };
 }
 
-// Fisher Transform (matches Pine v6 code exactly)
+function calcRSI(closes, len) {
+  const changes = [null];
+  for (let i = 1; i < closes.length; i++) {
+    changes.push(closes[i] - closes[i - 1]);
+  }
+  const gains = changes.map(v => v === null ? null : Math.max(v, 0));
+  const losses = changes.map(v => v === null ? null : -Math.min(v, 0));
+  const avgGain = calcRMA(gains, len);
+  const avgLoss = calcRMA(losses, len);
+
+  return avgGain.map((up, i) => {
+    const down = avgLoss[i];
+    if (up === null || down === null) return null;
+    if (down === 0) return 100;
+    if (up === 0) return 0;
+    return 100 - (100 / (1 + up / down));
+  });
+}
+
 function calcFisher(candles, len) {
   const fish1 = new Array(candles.length).fill(null);
   const fish2 = new Array(candles.length).fill(null);
@@ -61,8 +69,6 @@ function calcFisher(candles, len) {
 
   for (let i = 0; i < candles.length; i++) {
     const hl2 = (candles[i].high + candles[i].low) / 2;
-
-    // highest/lowest of hl2 over len
     let high_ = -Infinity, low_ = Infinity;
     const start = Math.max(0, i - len + 1);
     for (let j = start; j <= i; j++) {
@@ -70,11 +76,8 @@ function calcFisher(candles, len) {
       if (h2 > high_) high_ = h2;
       if (h2 < low_) low_ = h2;
     }
-
     const range = high_ - low_;
     let rawVal = range > 0 ? 0.66 * ((hl2 - low_) / range - 0.5) + 0.67 * (i > 0 ? values[i - 1] : 0) : 0;
-
-    // clamp
     if (rawVal > 0.999) rawVal = 0.999;
     if (rawVal < -0.999) rawVal = -0.999;
     values[i] = rawVal;
@@ -83,11 +86,9 @@ function calcFisher(candles, len) {
     fish1[i] = f;
     fish2[i] = i > 0 ? fish1[i - 1] : null;
   }
-
   return { fish1, fish2 };
 }
 
-// ATR
 function calcATR(candles, period = 21) {
   if (candles.length < period + 1) return new Array(candles.length).fill(null);
   const trs = [null];
@@ -109,74 +110,45 @@ function calcATR(candles, period = 21) {
 // DIRECTION LOGIC
 // ══════════════════════════════════════════════
 
-function determineDirection(tsiSlowSig, tsiFastSig, fisherVal) {
-  // tsiSlowSig = TSI(13,13,13) signal, tsiFastSig = TSI(8,8,8) signal
-  if (tsiSlowSig === null || tsiFastSig === null) {
+function determineDirection(rsiSMA, fisherVal, fisherTrigger) {
+  if (rsiSMA === null || fisherVal === null || fisherTrigger === null) {
     return { direction: 'HOLD', confidence: 'LOW', reason: 'insufficient_data' };
   }
 
-  const slowBelowFast = tsiSlowSig < tsiFastSig; // LONG candidate
-  const slowAboveFast = tsiSlowSig > tsiFastSig; // SHORT candidate
-
-  // LONG: TSI13 sig < TSI8 sig
-  if (slowBelowFast) {
-    const bothAbove0 = tsiSlowSig > 0 && tsiFastSig > 0;
-    const anyBelow0 = tsiSlowSig < 0 || tsiFastSig < 0;
-    if (bothAbove0 && fisherVal !== null && fisherVal < 0) {
-      return { direction: 'LONG', confidence: 'HIGH', reason: 'both_above0_fisher_below0', tpMult: 2.0, slMult: 1.5 };
-    }
-    if (anyBelow0) {
-      return { direction: 'LONG', confidence: 'MODERATE', reason: 'any_below0_fisher_ignored', tpMult: 2.0, slMult: 1.5 };
-    }
-    // Gap: both above 0 but fisher >= 0
-    if (bothAbove0) {
-      return { direction: 'LONG', confidence: 'LOW', reason: 'both_above0_fisher_same', tpMult: 1.5, slMult: 1.5 };
-    }
+  // LONG: RSI SMA > 50 + Fisher > -1.5 & Fisher > Trigger
+  if (rsiSMA > 50 && fisherVal > -1.5 && fisherVal > fisherTrigger) {
+    const confidence = rsiSMA > 60 ? 'HIGH' : 'MODERATE';
+    return { direction: 'LONG', confidence, reason: 'rsi_sma_above50_fisher_above_trigger' };
   }
 
-  // SHORT: TSI13 sig > TSI8 sig
-  if (slowAboveFast) {
-    const bothBelow0 = tsiSlowSig < 0 && tsiFastSig < 0;
-    const anyAbove0 = tsiSlowSig > 0 || tsiFastSig > 0;
-    if (bothBelow0 && fisherVal !== null && fisherVal > 0) {
-      return { direction: 'SHORT', confidence: 'HIGH', reason: 'both_below0_fisher_above0', tpMult: 2.0, slMult: 1.5 };
-    }
-    if (anyAbove0) {
-      return { direction: 'SHORT', confidence: 'MODERATE', reason: 'any_above0_fisher_ignored', tpMult: 2.0, slMult: 1.5 };
-    }
-    // Gap: both below 0 but fisher <= 0
-    if (bothBelow0) {
-      return { direction: 'SHORT', confidence: 'LOW', reason: 'both_below0_fisher_same', tpMult: 1.5, slMult: 1.5 };
-    }
+  // SHORT: RSI SMA < 50 + Fisher < +1.5 & Fisher < Trigger
+  if (rsiSMA < 50 && fisherVal < 1.5 && fisherVal < fisherTrigger) {
+    const confidence = rsiSMA < 40 ? 'HIGH' : 'MODERATE';
+    return { direction: 'SHORT', confidence, reason: 'rsi_sma_below50_fisher_below_trigger' };
   }
 
   return { direction: 'HOLD', confidence: 'LOW', reason: 'no_signal' };
 }
 
 // ══════════════════════════════════════════════
-// TP/SL (ATR-based)
+// TP/SL
 // ══════════════════════════════════════════════
 
-function calculateLevels(direction, currentPrice, atr, tpMult = 2.0, slMult = 1.5) {
+function calculateLevels(direction, currentPrice, atr) {
   if (direction === 'HOLD' || !atr) return null;
   const zw = currentPrice * 0.005;
   const zone = (p) => ({ low: +(p - zw / 2).toFixed(6), high: +(p + zw / 2).toFixed(6) });
 
   let tp, sl;
   if (direction === 'LONG') {
-    tp = currentPrice + atr * tpMult;
-    sl = currentPrice - atr * slMult;
+    tp = currentPrice + atr * 2.0;
+    sl = currentPrice - atr * 1.0;
   } else {
-    tp = currentPrice - atr * tpMult;
-    sl = currentPrice + atr * slMult;
+    tp = currentPrice - atr * 2.0;
+    sl = currentPrice + atr * 1.0;
   }
-
   const reward = Math.abs(tp - currentPrice), risk = Math.abs(sl - currentPrice);
-  return {
-    tpZone: zone(tp),
-    slZone: zone(sl),
-    riskReward: `1:${risk > 0 ? (reward / risk).toFixed(1) : '0'}`
-  };
+  return { tpZone: zone(tp), slZone: zone(sl), riskReward: `1:${risk > 0 ? (reward / risk).toFixed(1) : '0'}` };
 }
 
 // ══════════════════════════════════════════════
@@ -213,30 +185,28 @@ exports.handler = async (event) => {
     const currentPrice = closes[last];
 
     // ── Indicators ──
-    const tsiSlow = calcTSI(closes, 13, 13, 13);
-    const tsiFast = calcTSI(closes, 8, 8, 8);
+    const rsi = calcRSI(closes, 8);
+    const rsiSMA = calcSMA(rsi, 8);
     const fisher = calcFisher(candles, 8);
     const atrValues = calcATR(candles, 21);
 
-    const tsiSlowVal = tsiSlow.tsi[last];
-    const tsiSlowSig = tsiSlow.signal[last];
-    const tsiFastVal = tsiFast.tsi[last];
-    const tsiFastSig = tsiFast.signal[last];
+    const rsiVal = rsi[last];
+    const rsiSMAVal = rsiSMA[last];
     const fisherVal = fisher.fish1[last];
     const fisherTrigger = fisher.fish2[last];
     const atrVal = atrValues[last];
 
     // ── Direction ──
-    const decision = determineDirection(tsiSlowSig, tsiFastSig, fisherVal);
+    const decision = determineDirection(rsiSMAVal, fisherVal, fisherTrigger);
 
     // ── TP/SL ──
-    const levels = calculateLevels(decision.direction, currentPrice, atrVal, decision.tpMult, decision.slMult);
+    const levels = calculateLevels(decision.direction, currentPrice, atrVal);
 
     // ── AI commentary ──
     let ai = { comment: '', idealScenario: '', summary: null };
     try {
       const prompt = `${symbol} ${timeframe}: ${decision.direction} (${decision.confidence}, ${decision.reason})
-TSI(13,13,13): ${tsiSlowVal?.toFixed(2)} sig:${tsiSlowSig?.toFixed(2)} | TSI(8,8,8): ${tsiFastVal?.toFixed(2)} sig:${tsiFastSig?.toFixed(2)}
+RSI(8): ${rsiVal?.toFixed(2)} SMA(8): ${rsiSMAVal?.toFixed(2)}
 Fisher(8): ${fisherVal?.toFixed(2)} trigger:${fisherTrigger?.toFixed(2)} | ATR(21): ${atrVal?.toFixed(4)}
 가격: ${currentPrice}${levels ? ` | TP:${((levels.tpZone.low + levels.tpZone.high) / 2).toFixed(2)} SL:${((levels.slZone.low + levels.slZone.high) / 2).toFixed(2)}` : ' | HOLD'}
 한국어 코멘터리 JSON.`;
@@ -255,8 +225,7 @@ Fisher(8): ${fisherVal?.toFixed(2)} trigger:${fisherTrigger?.toFixed(2)} | ATR(2
 
     // ── Response ──
     const indicators = {
-      tsiSlow: tsiSlowVal, tsiSlowSignal: tsiSlowSig,
-      tsiFast: tsiFastVal, tsiFastSignal: tsiFastSig,
+      rsi: rsiVal, rsiSMA: rsiSMAVal,
       fisher: fisherVal, fisherTrigger,
       atr: atrVal
     };
