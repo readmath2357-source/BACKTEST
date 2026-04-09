@@ -1,7 +1,7 @@
-// netlify/functions/analyze.js v8.0
-// RSI(8) + SMA(8) + Fisher(8) + ATR(21) strategy
-// LONG: RSI SMA > 50 + Fisher > -1.5 & Fisher > Trigger
-// SHORT: RSI SMA < 50 + Fisher < +1.5 & Fisher < Trigger
+// netlify/functions/analyze.js v9.0
+// RSI(21) + SMA(21) + Fisher(8) + ATR(21)
+// LONG: (SMA>55 + Fisher>-1.5 & Fisher>Trigger) OR (SMA 45~55 + Fisher golden cross below -1)
+// SHORT: (SMA<55 + Fisher<1.5 & Fisher<Trigger) OR (SMA 45~55 + Fisher dead cross above +1)
 // Exit: ATR(21) TP×2 / SL×1
 
 const headers = {
@@ -12,7 +12,7 @@ const headers = {
 };
 
 // ══════════════════════════════════════════════
-// INDICATOR CALCULATIONS
+// INDICATORS
 // ══════════════════════════════════════════════
 
 function calcRMA(vals, len) {
@@ -45,14 +45,11 @@ function calcSMA(vals, len) {
 
 function calcRSI(closes, len) {
   const changes = [null];
-  for (let i = 1; i < closes.length; i++) {
-    changes.push(closes[i] - closes[i - 1]);
-  }
+  for (let i = 1; i < closes.length; i++) changes.push(closes[i] - closes[i - 1]);
   const gains = changes.map(v => v === null ? null : Math.max(v, 0));
   const losses = changes.map(v => v === null ? null : -Math.min(v, 0));
   const avgGain = calcRMA(gains, len);
   const avgLoss = calcRMA(losses, len);
-
   return avgGain.map((up, i) => {
     const down = avgLoss[i];
     if (up === null || down === null) return null;
@@ -66,7 +63,6 @@ function calcFisher(candles, len) {
   const fish1 = new Array(candles.length).fill(null);
   const fish2 = new Array(candles.length).fill(null);
   const values = new Array(candles.length).fill(0);
-
   for (let i = 0; i < candles.length; i++) {
     const hl2 = (candles[i].high + candles[i].low) / 2;
     let high_ = -Infinity, low_ = Infinity;
@@ -81,7 +77,6 @@ function calcFisher(candles, len) {
     if (rawVal > 0.999) rawVal = 0.999;
     if (rawVal < -0.999) rawVal = -0.999;
     values[i] = rawVal;
-
     const f = 0.5 * Math.log((1 + rawVal) / (1 - rawVal)) + 0.5 * (i > 0 && fish1[i - 1] !== null ? fish1[i - 1] : 0);
     fish1[i] = f;
     fish2[i] = i > 0 ? fish1[i - 1] : null;
@@ -107,24 +102,38 @@ function calcATR(candles, period = 21) {
 }
 
 // ══════════════════════════════════════════════
-// DIRECTION LOGIC
+// DIRECTION
 // ══════════════════════════════════════════════
 
-function determineDirection(rsiSMA, fisherVal, fisherTrigger) {
+function determineDirection(rsiSMA, fisherVal, fisherTrigger, prevFisher, prevTrigger) {
   if (rsiSMA === null || fisherVal === null || fisherTrigger === null) {
     return { direction: 'HOLD', confidence: 'LOW', reason: 'insufficient_data' };
   }
 
-  // LONG: RSI SMA > 50 + Fisher > -1.5 & Fisher > Trigger
-  if (rsiSMA > 50 && fisherVal > -1.5 && fisherVal > fisherTrigger) {
-    const confidence = rsiSMA > 60 ? 'HIGH' : 'MODERATE';
-    return { direction: 'LONG', confidence, reason: 'rsi_sma_above50_fisher_above_trigger' };
+  // ── LONG ──
+  // 1) SMA > 55 + Fisher > -1.5 & Fisher > Trigger
+  if (rsiSMA > 55 && fisherVal > -1.5 && fisherVal > fisherTrigger) {
+    return { direction: 'LONG', confidence: 'HIGH', reason: 'sma_above55_fisher_above_trigger' };
+  }
+  // 2) SMA 45~55 + Fisher golden cross below -1
+  if (rsiSMA >= 45 && rsiSMA <= 55 && prevFisher !== null && prevTrigger !== null) {
+    const goldenCross = fisherVal > fisherTrigger && prevFisher <= prevTrigger;
+    if (goldenCross && fisherVal < -1) {
+      return { direction: 'LONG', confidence: 'MODERATE', reason: 'sma_neutral_fisher_golden_cross' };
+    }
   }
 
-  // SHORT: RSI SMA < 50 + Fisher < +1.5 & Fisher < Trigger
-  if (rsiSMA < 50 && fisherVal < 1.5 && fisherVal < fisherTrigger) {
-    const confidence = rsiSMA < 40 ? 'HIGH' : 'MODERATE';
-    return { direction: 'SHORT', confidence, reason: 'rsi_sma_below50_fisher_below_trigger' };
+  // ── SHORT ──
+  // 1) SMA < 55 + Fisher < 1.5 & Fisher < Trigger
+  if (rsiSMA < 55 && fisherVal < 1.5 && fisherVal < fisherTrigger) {
+    return { direction: 'SHORT', confidence: 'HIGH', reason: 'sma_below55_fisher_below_trigger' };
+  }
+  // 2) SMA 45~55 + Fisher dead cross above +1
+  if (rsiSMA >= 45 && rsiSMA <= 55 && prevFisher !== null && prevTrigger !== null) {
+    const deadCross = fisherVal < fisherTrigger && prevFisher >= prevTrigger;
+    if (deadCross && fisherVal > 1) {
+      return { direction: 'SHORT', confidence: 'MODERATE', reason: 'sma_neutral_fisher_dead_cross' };
+    }
   }
 
   return { direction: 'HOLD', confidence: 'LOW', reason: 'no_signal' };
@@ -138,7 +147,6 @@ function calculateLevels(direction, currentPrice, atr) {
   if (direction === 'HOLD' || !atr) return null;
   const zw = currentPrice * 0.005;
   const zone = (p) => ({ low: +(p - zw / 2).toFixed(6), high: +(p + zw / 2).toFixed(6) });
-
   let tp, sl;
   if (direction === 'LONG') {
     tp = currentPrice + atr * 2.0;
@@ -185,8 +193,8 @@ exports.handler = async (event) => {
     const currentPrice = closes[last];
 
     // ── Indicators ──
-    const rsi = calcRSI(closes, 8);
-    const rsiSMA = calcSMA(rsi, 8);
+    const rsi = calcRSI(closes, 21);
+    const rsiSMA = calcSMA(rsi, 21);
     const fisher = calcFisher(candles, 8);
     const atrValues = calcATR(candles, 21);
 
@@ -194,10 +202,12 @@ exports.handler = async (event) => {
     const rsiSMAVal = rsiSMA[last];
     const fisherVal = fisher.fish1[last];
     const fisherTrigger = fisher.fish2[last];
+    const prevFisher = last > 0 ? fisher.fish1[last - 1] : null;
+    const prevTrigger = last > 0 ? fisher.fish2[last - 1] : null;
     const atrVal = atrValues[last];
 
     // ── Direction ──
-    const decision = determineDirection(rsiSMAVal, fisherVal, fisherTrigger);
+    const decision = determineDirection(rsiSMAVal, fisherVal, fisherTrigger, prevFisher, prevTrigger);
 
     // ── TP/SL ──
     const levels = calculateLevels(decision.direction, currentPrice, atrVal);
@@ -206,7 +216,7 @@ exports.handler = async (event) => {
     let ai = { comment: '', idealScenario: '', summary: null };
     try {
       const prompt = `${symbol} ${timeframe}: ${decision.direction} (${decision.confidence}, ${decision.reason})
-RSI(8): ${rsiVal?.toFixed(2)} SMA(8): ${rsiSMAVal?.toFixed(2)}
+RSI(21): ${rsiVal?.toFixed(2)} SMA(21): ${rsiSMAVal?.toFixed(2)}
 Fisher(8): ${fisherVal?.toFixed(2)} trigger:${fisherTrigger?.toFixed(2)} | ATR(21): ${atrVal?.toFixed(4)}
 가격: ${currentPrice}${levels ? ` | TP:${((levels.tpZone.low + levels.tpZone.high) / 2).toFixed(2)} SL:${((levels.slZone.low + levels.slZone.high) / 2).toFixed(2)}` : ' | HOLD'}
 한국어 코멘터리 JSON.`;
@@ -224,25 +234,15 @@ Fisher(8): ${fisherVal?.toFixed(2)} trigger:${fisherTrigger?.toFixed(2)} | ATR(2
     } catch (e) { console.error('[analyze] AI error:', e.message); }
 
     // ── Response ──
-    const indicators = {
-      rsi: rsiVal, rsiSMA: rsiSMAVal,
-      fisher: fisherVal, fisherTrigger,
-      atr: atrVal
-    };
+    const indicators = { rsi: rsiVal, rsiSMA: rsiSMAVal, fisher: fisherVal, fisherTrigger, atr: atrVal };
 
     const result = {
-      mode: 'simple',
-      direction: decision.direction,
-      confidence: decision.confidence,
-      reason: decision.reason,
-      currentPrice,
-      tpZone: levels?.tpZone || null,
-      slZone: levels?.slZone || null,
+      mode: 'simple', direction: decision.direction, confidence: decision.confidence,
+      reason: decision.reason, currentPrice,
+      tpZone: levels?.tpZone || null, slZone: levels?.slZone || null,
       riskReward: levels?.riskReward || '—',
-      idealScenario: ai.idealScenario || '',
-      comment: ai.comment || '',
-      summary: ai.summary || null,
-      calculatedIndicators: indicators
+      idealScenario: ai.idealScenario || '', comment: ai.comment || '',
+      summary: ai.summary || null, calculatedIndicators: indicators
     };
 
     return { statusCode: 200, headers, body: JSON.stringify(result) };
