@@ -1,7 +1,7 @@
 // netlify/functions/analyze.js v9.0
 // RSI(21) + SMA(21) + Fisher(8) + ATR(21)
-// LONG: (SMA>55 + Fisher>-1.5 & Fisher>Trigger) OR (SMA 45~55 + Fisher golden cross below -1)
-// SHORT: (SMA<55 + Fisher<1.5 & Fisher<Trigger) OR (SMA 45~55 + Fisher dead cross above +1)
+// LONG: SMA>50 + Fisher<0 & Fisher>Trigger
+// SHORT: SMA<50 + Fisher>0 & Fisher<Trigger
 // Exit: ATR(21) TP×2 / SL×1
 
 const headers = {
@@ -105,35 +105,19 @@ function calcATR(candles, period = 21) {
 // DIRECTION
 // ══════════════════════════════════════════════
 
-function determineDirection(rsiSMA, fisherVal, fisherTrigger, prevFisher, prevTrigger) {
+function determineDirection(rsiSMA, fisherVal, fisherTrigger) {
   if (rsiSMA === null || fisherVal === null || fisherTrigger === null) {
     return { direction: 'HOLD', confidence: 'LOW', reason: 'insufficient_data' };
   }
 
-  // ── LONG ──
-  // 1) SMA > 55 + Fisher > -1.5 & Fisher > Trigger
-  if (rsiSMA > 55 && fisherVal > -1.5 && fisherVal > fisherTrigger) {
-    return { direction: 'LONG', confidence: 'HIGH', reason: 'sma_above55_fisher_above_trigger' };
-  }
-  // 2) SMA 45~55 + Fisher golden cross below -1
-  if (rsiSMA >= 45 && rsiSMA <= 55 && prevFisher !== null && prevTrigger !== null) {
-    const goldenCross = fisherVal > fisherTrigger && prevFisher <= prevTrigger;
-    if (goldenCross && fisherVal < -1) {
-      return { direction: 'LONG', confidence: 'MODERATE', reason: 'sma_neutral_fisher_golden_cross' };
-    }
+  // LONG: SMA > 50 + Fisher < 0 & Fisher > Trigger
+  if (rsiSMA > 50 && fisherVal < 0 && fisherVal > fisherTrigger) {
+    return { direction: 'LONG', confidence: 'HIGH', reason: 'sma_above50_fisher_below0_above_trigger' };
   }
 
-  // ── SHORT ──
-  // 1) SMA < 55 + Fisher < 1.5 & Fisher < Trigger
-  if (rsiSMA < 55 && fisherVal < 1.5 && fisherVal < fisherTrigger) {
-    return { direction: 'SHORT', confidence: 'HIGH', reason: 'sma_below55_fisher_below_trigger' };
-  }
-  // 2) SMA 45~55 + Fisher dead cross above +1
-  if (rsiSMA >= 45 && rsiSMA <= 55 && prevFisher !== null && prevTrigger !== null) {
-    const deadCross = fisherVal < fisherTrigger && prevFisher >= prevTrigger;
-    if (deadCross && fisherVal > 1) {
-      return { direction: 'SHORT', confidence: 'MODERATE', reason: 'sma_neutral_fisher_dead_cross' };
-    }
+  // SHORT: SMA < 50 + Fisher > 0 & Fisher < Trigger
+  if (rsiSMA < 50 && fisherVal > 0 && fisherVal < fisherTrigger) {
+    return { direction: 'SHORT', confidence: 'HIGH', reason: 'sma_below50_fisher_above0_below_trigger' };
   }
 
   return { direction: 'HOLD', confidence: 'LOW', reason: 'no_signal' };
@@ -202,12 +186,10 @@ exports.handler = async (event) => {
     const rsiSMAVal = rsiSMA[last];
     const fisherVal = fisher.fish1[last];
     const fisherTrigger = fisher.fish2[last];
-    const prevFisher = last > 0 ? fisher.fish1[last - 1] : null;
-    const prevTrigger = last > 0 ? fisher.fish2[last - 1] : null;
     const atrVal = atrValues[last];
 
     // ── Direction ──
-    const decision = determineDirection(rsiSMAVal, fisherVal, fisherTrigger, prevFisher, prevTrigger);
+    const decision = determineDirection(rsiSMAVal, fisherVal, fisherTrigger);
 
     // ── TP/SL ──
     const levels = calculateLevels(decision.direction, currentPrice, atrVal);
