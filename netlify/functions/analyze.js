@@ -1,6 +1,7 @@
 // netlify/functions/analyze.js v7.0
-// TSI + Fisher Transform Entry | ATR Swing Snap TP/SL
-// Based on Pine Script: "TSI+Fisher Entry | ATR Swing Snap TP/SL"
+// Fisher Transform(9) + TSI(21,21,21) → direction
+// ATR(13) × 1.0 → TP/SL
+// AI (Claude) provides Korean commentary ONLY
 
 const headers = {
   'Content-Type': 'application/json',
@@ -10,22 +11,17 @@ const headers = {
 };
 
 // ══════════════════════════════════════════════
-// PARAMETERS (from Pine Script defaults + user screenshot)
+// PARAMETERS
 // ══════════════════════════════════════════════
 
 const PARAMS = {
+  fisherLen: 9,
   tsiLong: 21,
   tsiShort: 21,
-  tsiSignal: 21,
-  fisherLen: 9,
-  atrLen: 21,
-  tpAtrMult: 1.5,
-  slAtrMult: 1.5,
-  swingLeft: 5,
-  swingRight: 5,
-  snapAtrMult: 0.5,
-  slPadMult: 0.1,
-  minRR: 1.5,
+  tsiSignalLen: 21,
+  atrLen: 13,
+  atrMult: 1.0,
+  lookback: 3
 };
 
 // ══════════════════════════════════════════════
@@ -37,7 +33,7 @@ function calcEMA(vals, len) {
   let prev = null, seedCount = 0, seedSum = 0, seeded = false;
   for (let i = 0; i < vals.length; i++) {
     const v = vals[i];
-    if (v === null || v === undefined || isNaN(v)) { r.push(null); continue; }
+    if (v === null || v === undefined) { r.push(null); continue; }
     if (!seeded) {
       seedSum += v; seedCount++;
       if (seedCount < len) { r.push(null); continue; }
@@ -49,144 +45,178 @@ function calcEMA(vals, len) {
   return r;
 }
 
-// ── TSI (True Strength Index) ──
-function calcTSI(closes, longLen, shortLen, sigLen) {
-  // pc = change(close)
-  const pc = [null];
-  for (let i = 1; i < closes.length; i++) {
-    pc.push(closes[i] - closes[i - 1]);
-  }
-
-  // double_smooth(src, longLen, shortLen) = ema(ema(src, longLen), shortLen)
-  const dsPC = calcEMA(calcEMA(pc, longLen), shortLen);
-  const dsAbsPC = calcEMA(calcEMA(pc.map(v => v !== null ? Math.abs(v) : null), longLen), shortLen);
-
-  // tsi = 100 * dsPC / dsAbsPC
-  const tsi = dsPC.map((v, i) => {
-    if (v === null || dsAbsPC[i] === null || dsAbsPC[i] === 0) return null;
-    return 100 * v / dsAbsPC[i];
-  });
-
-  // signal = ema(tsi, sigLen)
-  const signal = calcEMA(tsi, sigLen);
-
-  return { tsi, signal };
-}
-
-// ── Fisher Transform ──
-function calcFisher(candles, len) {
-  const hl2 = candles.map(c => (c.high + c.low) / 2);
-  const fish1 = new Array(candles.length).fill(null);
-  const fish2 = new Array(candles.length).fill(null);
-  let fishVal = 0;
-  let prevFish1 = 0;
-
-  for (let i = 0; i < candles.length; i++) {
-    if (i < len - 1) continue;
-
-    // highest/lowest of hl2 over len
-    let hi = -Infinity, lo = Infinity;
-    for (let j = i - len + 1; j <= i; j++) {
-      if (hl2[j] > hi) hi = hl2[j];
-      if (hl2[j] < lo) lo = hl2[j];
-    }
-
-    let rawF = 0;
-    if (hi !== lo) {
-      rawF = 0.66 * ((hl2[i] - lo) / (hi - lo) - 0.5) + 0.67 * fishVal;
-    }
-    fishVal = Math.max(Math.min(rawF, 0.999), -0.999);
-
-    const f1 = 0.5 * Math.log((1.0 + fishVal) / (1.0 - fishVal)) + 0.5 * prevFish1;
-    fish1[i] = f1;
-    fish2[i] = prevFish1;
-    prevFish1 = f1;
-  }
-
-  return { fish1, fish2 };
-}
-
-// ── ATR ──
-function calcATR(candles, period) {
-  const atr = new Array(candles.length).fill(null);
-  if (candles.length < period + 1) return atr;
-
-  const trs = [0];
+function calcATR(candles, period = 13) {
+  if (candles.length < period + 1) return [];
+  const trs = [null];
   for (let i = 1; i < candles.length; i++) {
-    const h = candles[i].high, l = candles[i].low, pc = candles[i - 1].close;
+    const h = candles[i].high, l = candles[i].low, pc = candles[i-1].close;
     trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
   }
-
   let sum = 0;
   for (let i = 1; i <= period; i++) sum += trs[i];
-  atr[period] = sum / period;
+  const atr = new Array(period).fill(null);
+  atr.push(sum / period);
   for (let i = period + 1; i < trs.length; i++) {
-    atr[i] = (atr[i - 1] * (period - 1) + trs[i]) / period;
+    atr.push((atr[i-1] * (period - 1) + trs[i]) / period);
   }
   return atr;
 }
 
-// ── Swing Point Detection ──
-function detectSwings(candles, leftBars, rightBars) {
-  const swingHighs = []; // { index, price }
-  const swingLows = [];
+// ── Fisher Transform (9) ──
+function calcFisher(candles, len = 9) {
+  const hl2 = candles.map(c => (c.high + c.low) / 2);
+  const fisher = [];
+  let value = 0, fish1 = 0;
 
-  for (let i = leftBars; i < candles.length - rightBars; i++) {
-    // Swing High
-    let isHigh = true;
-    for (let j = i - leftBars; j <= i + rightBars; j++) {
-      if (j === i) continue;
-      if (candles[j].high >= candles[i].high) { isHigh = false; break; }
-    }
-    if (isHigh) swingHighs.push({ index: i, price: candles[i].high });
+  for (let i = 0; i < candles.length; i++) {
+    if (i < len - 1) { fisher.push(null); continue; }
 
-    // Swing Low
-    let isLow = true;
-    for (let j = i - leftBars; j <= i + rightBars; j++) {
-      if (j === i) continue;
-      if (candles[j].low <= candles[i].low) { isLow = false; break; }
+    let high_ = -Infinity, low_ = Infinity;
+    for (let j = i - len + 1; j <= i; j++) {
+      if (hl2[j] > high_) high_ = hl2[j];
+      if (hl2[j] < low_) low_ = hl2[j];
     }
-    if (isLow) swingLows.push({ index: i, price: candles[i].low });
+
+    const range = high_ - low_;
+    let raw = range > 0 ? 0.66 * ((hl2[i] - low_) / range - 0.5) + 0.67 * value : 0;
+    // clamp
+    if (raw > 0.999) raw = 0.999;
+    if (raw < -0.999) raw = -0.999;
+    value = raw;
+
+    const newFish = 0.5 * Math.log((1 + value) / (1 - value)) + 0.5 * fish1;
+    fisher.push(newFish);
+    fish1 = newFish;
+  }
+  return fisher;
+}
+
+// ── TSI (True Strength Index) ──
+function calcTSI(closes, longLen = 21, shortLen = 21, signalLen = 21) {
+  // pc = change(close)
+  const pc = [null];
+  for (let i = 1; i < closes.length; i++) {
+    pc.push(closes[i] - closes[i-1]);
+  }
+  const abspc = pc.map(v => v === null ? null : Math.abs(v));
+
+  // double smooth
+  const ds = calcEMA(calcEMA(pc, longLen), shortLen);
+  const dsAbs = calcEMA(calcEMA(abspc, longLen), shortLen);
+
+  const tsiValue = ds.map((v, i) => {
+    if (v === null || dsAbs[i] === null || dsAbs[i] === 0) return null;
+    return 100 * (v / dsAbs[i]);
+  });
+
+  const tsiSignal = calcEMA(tsiValue, signalLen);
+
+  return { tsiValue, tsiSignal };
+}
+
+// ══════════════════════════════════════════════
+// DIRECTION: Fisher rising + TSI signal rising → LONG
+//            Fisher falling + TSI signal falling → SHORT
+//            With duplicate entry prevention
+// ══════════════════════════════════════════════
+
+function determineDirection(fisher, tsiSignal, last, lookback = 3) {
+  if (last < lookback + 1) return { direction: 'HOLD', confidence: 'LOW' };
+
+  const fNow = fisher[last], fPrev = fisher[last - lookback];
+  const tNow = tsiSignal[last], tPrev = tsiSignal[last - lookback];
+
+  if (fNow === null || fPrev === null || tNow === null || tPrev === null) {
+    return { direction: 'HOLD', confidence: 'LOW' };
   }
 
-  return { swingHighs, swingLows };
-}
+  const fRising = fNow > fPrev;
+  const fFalling = fNow < fPrev;
+  const tRising = tNow > tPrev;
+  const tFalling = tNow < tPrev;
 
-// ── Snap to nearest swing point ──
-function snapToNearest(basePrice, candidates, snapRange) {
-  let best = null;
-  let bestDist = snapRange;
-  for (const c of candidates) {
-    const dist = Math.abs(c.price - basePrice);
-    if (dist <= snapRange && dist < bestDist) {
-      best = c.price;
-      bestDist = dist;
+  let longEntry = fRising && tRising;
+  let shortEntry = fFalling && tFalling;
+
+  // Duplicate prevention: check if previous bar also had same signal
+  if (last >= lookback + 2) {
+    const fPrevBar = fisher[last - 1], fPrevLook = fisher[last - 1 - lookback];
+    const tPrevBar = tsiSignal[last - 1], tPrevLook = tsiSignal[last - 1 - lookback];
+    if (fPrevBar !== null && fPrevLook !== null && tPrevBar !== null && tPrevLook !== null) {
+      const prevLong = fPrevBar > fPrevLook && tPrevBar > tPrevLook;
+      const prevShort = fPrevBar < fPrevLook && tPrevBar < tPrevLook;
+      if (longEntry && prevLong) longEntry = false;
+      if (shortEntry && prevShort) shortEntry = false;
     }
   }
-  return best !== null ? best : basePrice;
+
+  if (longEntry) {
+    // Confidence based on strength
+    const fStrength = Math.abs(fNow - fPrev);
+    const tStrength = Math.abs(tNow - tPrev);
+    const confidence = (fStrength > 0.5 && tStrength > 3) ? 'HIGH' : 'MODERATE';
+    return { direction: 'LONG', confidence, fisher: fNow, tsiSignal: tNow };
+  }
+  if (shortEntry) {
+    const fStrength = Math.abs(fNow - fPrev);
+    const tStrength = Math.abs(tNow - tPrev);
+    const confidence = (fStrength > 0.5 && tStrength > 3) ? 'HIGH' : 'MODERATE';
+    return { direction: 'SHORT', confidence, fisher: fNow, tsiSignal: tNow };
+  }
+
+  return { direction: 'HOLD', confidence: 'LOW', fisher: fNow, tsiSignal: tNow };
 }
 
-// ── Crossover / Crossunder ──
-function crossover(a, b, i) {
-  if (i < 1 || a[i] === null || b[i] === null || a[i - 1] === null || b[i - 1] === null) return false;
-  return a[i] > b[i] && a[i - 1] <= b[i - 1];
-}
+// ══════════════════════════════════════════════
+// TP/SL: ATR(13) × 1.0
+// ══════════════════════════════════════════════
 
-function crossunder(a, b, i) {
-  if (i < 1 || a[i] === null || b[i] === null || a[i - 1] === null || b[i - 1] === null) return false;
-  return a[i] < b[i] && a[i - 1] >= b[i - 1];
+function calculateLevels(direction, currentPrice, atr, isStrategic) {
+  if (direction === 'HOLD' || !atr) return null;
+  const mult = PARAMS.atrMult; // 1.0
+  const zw = currentPrice * 0.003;
+  const zone = (p) => ({ low: +(p - zw / 2).toFixed(6), high: +(p + zw / 2).toFixed(6) });
+
+  if (!isStrategic) {
+    let tp, sl;
+    if (direction === 'LONG') {
+      tp = currentPrice + atr * mult;
+      sl = currentPrice - atr * mult;
+    } else {
+      tp = currentPrice - atr * mult;
+      sl = currentPrice + atr * mult;
+    }
+    const reward = Math.abs(tp - currentPrice), risk = Math.abs(sl - currentPrice);
+    return { mode: 'simple', tpZone: zone(tp), slZone: zone(sl), riskReward: `1:${risk > 0 ? (reward / risk).toFixed(1) : '0'}` };
+  }
+
+  // Strategic: 2-level TP/SL
+  let tp1, tp2, sl1, sl2;
+  if (direction === 'LONG') {
+    tp1 = currentPrice + atr * mult;
+    tp2 = currentPrice + atr * mult * 1.8;
+    sl1 = currentPrice - atr * mult;
+    sl2 = currentPrice - atr * mult * 1.5;
+  } else {
+    tp1 = currentPrice - atr * mult;
+    tp2 = currentPrice - atr * mult * 1.8;
+    sl1 = currentPrice + atr * mult;
+    sl2 = currentPrice + atr * mult * 1.5;
+  }
+
+  return { mode: 'strategic', tp1Zone: zone(tp1), tp2Zone: zone(tp2), sl1Zone: zone(sl1), sl2Zone: zone(sl2), tp1, tp2, sl1, sl2 };
 }
 
 // ══════════════════════════════════════════════
 // AI COMMENTARY
 // ══════════════════════════════════════════════
 
-const COMMENTARY_SYSTEM = `You are a Korean chart commentator. You receive pre-calculated TSI+Fisher signals and ATR Swing Snap levels. Provide brief Korean commentary ONLY.
+const COMMENTARY_SYSTEM = `You are a Korean chart commentator. You receive pre-calculated indicators and a deterministic signal. Provide brief Korean commentary ONLY.
 RULES:
-- All Korean. Use: 추세강도(TSI), 전환시그널(Fisher), 변동성(ATR), 스윙포인트, 지지/저항
+- All Korean. Use: 추세 전환, 모멘텀, 변동성, 지지선/저항선
 - Do NOT provide prices or override direction. Keep concise.
 Respond in valid JSON only:
-{"comment":"<Korean, <80 chars>","idealScenario":"<Korean, 1-2 sentences>"}`;
+{"comment":"<Korean, <80 chars>","idealScenario":"<Korean, 1-2 sentences>","summary":{"trend":{"signal":"BULLISH"/"BEARISH"/"NEUTRAL","detail":"<Korean>"},"volatility":{"signal":"...","detail":"..."},"fairValue":{"signal":"...","detail":"..."},"confluence":{"signal":"...","detail":"..."}}}`;
 
 // ══════════════════════════════════════════════
 // HANDLER
@@ -201,110 +231,50 @@ exports.handler = async (event) => {
   try {
     const body = JSON.parse(event.body || '{}');
     const { candles, symbol, timeframe, mode } = body;
+    const isStrategic = mode === 'strategic';
 
-    if (!candles || candles.length < 50) {
-      return { statusCode: 200, headers, body: JSON.stringify({ error: `캔들 부족: ${candles ? candles.length : 0}개 (최소 50개)` }) };
+    if (!candles || candles.length < 30) {
+      return { statusCode: 200, headers, body: JSON.stringify({ error: `캔들 부족: ${candles ? candles.length : 0}개 (최소 30개)` }) };
     }
 
-    const P = PARAMS;
     const closes = candles.map(c => c.close);
     const last = closes.length - 1;
     const currentPrice = closes[last];
 
     // ── Indicators ──
-    const tsiData = calcTSI(closes, P.tsiLong, P.tsiShort, P.tsiSignal);
-    const fisherData = calcFisher(candles, P.fisherLen);
-    const atrValues = calcATR(candles, P.atrLen);
-
-    const tsiVal = tsiData.tsi[last];
-    const tsiSig = tsiData.signal[last];
-    const fish1 = fisherData.fish1[last];
-    const fish2 = fisherData.fish2[last];
+    const fisher = calcFisher(candles, PARAMS.fisherLen);
+    const { tsiValue, tsiSignal } = calcTSI(closes, PARAMS.tsiLong, PARAMS.tsiShort, PARAMS.tsiSignalLen);
+    const atrValues = calcATR(candles, PARAMS.atrLen);
     const atrVal = atrValues[last];
 
-    // ── Entry Conditions (exact Pine Script logic) ──
-    // Long:  TSI signal > 0  AND  Fisher golden cross  AND  fish2 < 1
-    // Short: TSI signal < 0  AND  Fisher dead cross    AND  fish2 > -1
-    const fisherGoldenX = crossover(fisherData.fish1, fisherData.fish2, last);
-    const fisherDeadX = crossunder(fisherData.fish1, fisherData.fish2, last);
+    // ── Direction ──
+    const decision = determineDirection(fisher, tsiSignal, last, PARAMS.lookback);
 
-    const longEntry = tsiSig !== null && tsiSig > 0 && fisherGoldenX && fish2 !== null && fish2 < 1.0;
-    const shortEntry = tsiSig !== null && tsiSig < 0 && fisherDeadX && fish2 !== null && fish2 > -1.0;
+    // ── TP/SL ──
+    const levels = calculateLevels(decision.direction, currentPrice, atrVal, isStrategic);
 
-    let direction = 'HOLD';
-    let confidence = 'LOW';
-
-    if (longEntry) {
-      direction = 'LONG';
-      confidence = tsiSig > 5 ? 'HIGH' : tsiSig > 2 ? 'MODERATE' : 'LOW';
-    } else if (shortEntry) {
-      direction = 'SHORT';
-      confidence = tsiSig < -5 ? 'HIGH' : tsiSig < -2 ? 'MODERATE' : 'LOW';
-    }
-
-    // ── TP/SL with ATR Swing Snap ──
-    let levels = null;
-    if (direction !== 'HOLD' && atrVal) {
-      // Get recent swing points (last 20)
-      const swings = detectSwings(candles, P.swingLeft, P.swingRight);
-      const recentHighs = swings.swingHighs.slice(-20);
-      const recentLows = swings.swingLows.slice(-20);
-      const snapRange = atrVal * P.snapAtrMult;
-      const pad = atrVal * P.slPadMult;
-
-      let tp, sl;
-      if (direction === 'LONG') {
-        const baseTP = currentPrice + atrVal * P.tpAtrMult;
-        const baseSL = currentPrice - atrVal * P.slAtrMult;
-        tp = snapToNearest(baseTP, recentHighs, snapRange);
-        sl = snapToNearest(baseSL, recentLows, snapRange) - pad;
-        // Min R:R check
-        const reward = tp - currentPrice;
-        const risk = currentPrice - sl;
-        if (risk > 0 && reward / risk < P.minRR) {
-          tp = currentPrice + risk * P.minRR;
-        }
-      } else {
-        const baseTP = currentPrice - atrVal * P.tpAtrMult;
-        const baseSL = currentPrice + atrVal * P.slAtrMult;
-        tp = snapToNearest(baseTP, recentLows, snapRange);
-        sl = snapToNearest(baseSL, recentHighs, snapRange) + pad;
-        const reward = currentPrice - tp;
-        const risk = sl - currentPrice;
-        if (risk > 0 && reward / risk < P.minRR) {
-          tp = currentPrice - risk * P.minRR;
-        }
-      }
-
-      const zw = currentPrice * 0.003;
-      const zone = (p) => ({ low: +(p - zw / 2).toFixed(6), high: +(p + zw / 2).toFixed(6) });
-      const reward = Math.abs(tp - currentPrice);
-      const risk = Math.abs(sl - currentPrice);
-
-      levels = {
-        tpZone: zone(tp),
-        slZone: zone(sl),
-        tp, sl,
-        riskReward: `1:${risk > 0 ? (reward / risk).toFixed(1) : '0'}`,
-        snappedTP: tp !== (direction === 'LONG' ? currentPrice + atrVal * P.tpAtrMult : currentPrice - atrVal * P.tpAtrMult),
-        snappedSL: sl !== (direction === 'LONG' ? currentPrice - atrVal * P.slAtrMult - pad : currentPrice + atrVal * P.slAtrMult + pad),
-      };
-    }
+    // ── Volume ──
+    const volumes = candles.map(c => c.volume);
+    const avgVol = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+    const recVol = volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
+    const volTrend = recVol > avgVol * 1.2 ? 'UP' : recVol < avgVol * 0.8 ? 'DOWN' : 'STABLE';
 
     // ── AI commentary ──
-    let ai = { comment: '', idealScenario: '' };
+    let ai = { comment: '', idealScenario: '', summary: null };
     try {
-      const prompt = `${symbol} ${timeframe}: ${direction} (${confidence})
-TSI: ${tsiVal?.toFixed(2)} / Signal: ${tsiSig?.toFixed(2)}
-Fisher: ${fish1?.toFixed(3)} / ${fish2?.toFixed(3)} | Cross: ${fisherGoldenX ? 'Golden' : fisherDeadX ? 'Dead' : 'None'}
-ATR(${P.atrLen}): ${atrVal?.toFixed(4)}
-${levels ? `TP: ${levels.tp?.toFixed(2)} (snap:${levels.snappedTP}) SL: ${levels.sl?.toFixed(2)} (snap:${levels.snappedSL}) R:R=${levels.riskReward}` : 'HOLD'}
+      const fVal = fisher[last]?.toFixed(3) || '?';
+      const tVal = tsiSignal[last]?.toFixed(2) || '?';
+
+      const prompt = `${symbol} ${timeframe}: ${decision.direction} (${decision.confidence})
+Fisher(9): ${fVal} | TSI Signal(21): ${tVal} | ATR(13): ${atrVal?.toFixed(4) || '?'}
+가격: ${currentPrice} | 거래량: ${volTrend}
+${decision.direction !== 'HOLD' && levels ? `TP:${isStrategic ? levels.tp1?.toFixed(2) + '/' + levels.tp2?.toFixed(2) : ((levels.tpZone.low + levels.tpZone.high) / 2).toFixed(2)} SL:${isStrategic ? levels.sl1?.toFixed(2) + '/' + levels.sl2?.toFixed(2) : ((levels.slZone.low + levels.slZone.high) / 2).toFixed(2)}` : 'HOLD'}
 한국어 코멘터리 JSON.`;
 
       const r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 400, system: COMMENTARY_SYSTEM, messages: [{ role: 'user', content: prompt }] })
+        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 800, system: COMMENTARY_SYSTEM, messages: [{ role: 'user', content: prompt }] })
       });
       if (r.ok) {
         const d = await r.json();
@@ -314,26 +284,47 @@ ${levels ? `TP: ${levels.tp?.toFixed(2)} (snap:${levels.snappedTP}) SL: ${levels
     } catch (e) { console.error('[analyze] AI error:', e.message); }
 
     // ── Response ──
-    const result = {
-      direction,
-      confidence,
-      currentPrice,
-      tpZone: levels?.tpZone || null,
-      slZone: levels?.slZone || null,
-      riskReward: levels?.riskReward || '—',
-      comment: ai.comment || '',
-      idealScenario: ai.idealScenario || '',
-      indicators: {
-        tsi: tsiVal,
-        tsiSignal: tsiSig,
-        fisher1: fish1,
-        fisher2: fish2,
-        atr: atrVal,
-        fisherGoldenX,
-        fisherDeadX,
-      },
-      params: P,
+    const indicators = {
+      fisher: fisher[last], tsiValue: tsiValue[last], tsiSignal: tsiSignal[last],
+      atr: atrVal, avgVolume: avgVol, recentVolume: recVol, params: PARAMS
     };
+
+    let result;
+    if (isStrategic && decision.direction !== 'HOLD' && levels) {
+      const dir = decision.direction;
+      const [t1, t2, s1, s2] = dir === 'LONG'
+        ? ['1차 저항', '2차 저항', '1차 지지', '2차 지지']
+        : ['1차 지지', '2차 지지', '1차 저항', '2차 저항'];
+
+      result = {
+        mode: 'strategic', direction: dir, confidence: decision.confidence, currentPrice,
+        idealScenario: ai.idealScenario || '',
+        levels: { tp1Zone: levels.tp1Zone, tp2Zone: levels.tp2Zone, sl1Zone: levels.sl1Zone, sl2Zone: levels.sl2Zone },
+        scenarios: {
+          profitPath: { name: '익절 경로', probability: decision.confidence === 'HIGH' ? '65%' : '55%',
+            trigger: { label: '1차 익절', price: levels.tp1, pct: '(50%)' },
+            outcomes: [
+              { name: '1차 손절', probability: '25%', type: 'sl', step: { label: '1차 손절', price: levels.sl1, pct: '(50%)' }, description: `${t1} 도달 후 반전 시 ${s1}에서 잔여 청산` },
+              { name: '2차 익절', probability: decision.confidence === 'HIGH' ? '40%' : '30%', type: 'tp', step: { label: '2차 익절', price: levels.tp2, pct: '(50%)' }, description: `추세 지속 시 ${t2}까지 잔여 보유` }
+            ] },
+          lossPath: { name: '손절 경로', probability: decision.confidence === 'HIGH' ? '35%' : '45%',
+            trigger: { label: '1차 손절', price: levels.sl1, pct: '(50%)' },
+            outcomes: [
+              { name: '2차 익절 회복', probability: '20%', type: 'tp', step: { label: '2차 익절', price: levels.tp2, pct: '(50%)' }, description: `${s1} 이탈 후 반등 시 ${t2}까지 회복` },
+              { name: '2차 손절', probability: decision.confidence === 'HIGH' ? '15%' : '25%', type: 'sl', step: { label: '2차 손절', price: levels.sl2, pct: '(50%)' }, description: `추세 이탈 지속 시 ${s2}에서 전량 청산` }
+            ] }
+        },
+        exitStrategy: { partialExit: `${t1} 도달 시 50% 청산`, fullExit: `${s2} 이탈 시 전량 청산`, trailingStop: `${t1} 도달 후 진입가를 트레일링 스탑으로 이동` },
+        comment: ai.comment || '', summary: ai.summary || null, calculatedIndicators: indicators
+      };
+    } else {
+      result = {
+        mode: 'simple', direction: decision.direction, confidence: decision.confidence, currentPrice,
+        tpZone: levels?.tpZone || null, slZone: levels?.slZone || null, riskReward: levels?.riskReward || '—',
+        idealScenario: ai.idealScenario || '', comment: ai.comment || '', summary: ai.summary || null,
+        calculatedIndicators: indicators
+      };
+    }
 
     return { statusCode: 200, headers, body: JSON.stringify(result) };
   } catch (err) {
